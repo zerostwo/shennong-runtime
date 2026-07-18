@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Publish daemon, worker, and IDE images to Docker Hub from `main`, version
+  tags, and manual GitHub Actions runs; the IDE is built from the exact worker
+  digest produced by the same run.
+
+### Changed
+
+- Default Docker Compose to the public `zerostwo/shennong-runtime-*` images and
+  built-in stable network values while retaining immutable image overrides for
+  production rollbacks.
+
 ### Fixed
 
 - Treat Docker's container-removal-already-in-progress conflict as an

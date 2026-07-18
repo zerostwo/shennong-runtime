@@ -2,7 +2,7 @@ name: shennong-runtime
 
 services:
   runtime:
-    image: ${SHENNONG_RUNTIME_DAEMON_IMAGE:?set a digest-pinned daemon image}
+    image: ${SHENNONG_RUNTIME_DAEMON_IMAGE:-zerostwo/shennong-runtime-daemon:latest}
     container_name: shennong-runtime
     restart: unless-stopped
     user: "${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}:${SHENNONG_RUNTIME_GID:?set the rootless Docker owner GID}"
@@ -23,7 +23,7 @@ services:
       SHENNONG_ROOTLESS_DOCKER_SOCKET: /run/shennong-rootless/docker.sock
       SHENNONG_JOB_EGRESS_NETWORK: shennong-job-egress
       SHENNONG_SESSION_PROXY_NETWORK: shennong-session-proxy
-      SHENNONG_RUNTIME_INSTANCE_ID: ${SHENNONG_RUNTIME_INSTANCE_ID:?set a stable per-worker Runtime instance id}
+      SHENNONG_RUNTIME_INSTANCE_ID: ${SHENNONG_RUNTIME_INSTANCE_ID:-runtime-worker-1}
       # Runtime checks the root-owned attestation against the live RootlessKit
       # child PID before health succeeds or any Job/Session is launched.
       SHENNONG_ROOTLESS_UID: ${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}
@@ -31,7 +31,7 @@ services:
       SHENNONG_EGRESS_POLICY_STATE_FILE: /run/shennong-egress/policy-${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}.ready
       SHENNONG_JOB_BRIDGE: ${SHENNONG_JOB_BRIDGE:-sn-job-egress}
       SHENNONG_SESSION_BRIDGE: ${SHENNONG_SESSION_BRIDGE:-sn-session}
-      SHENNONG_RUNTIME_PROXY_V4: ${SHENNONG_RUNTIME_PROXY_V4:?set the exact Runtime proxy source IPv4 /32}
+      SHENNONG_RUNTIME_PROXY_V4: ${SHENNONG_RUNTIME_PROXY_V4:-10.252.0.1/32}
       SHENNONG_JWT_ALGORITHM: EdDSA
       SHENNONG_JWT_PUBLIC_KEY_FILE: /run/secrets/shennong_os_jwt_public_key
       SHENNONG_JWT_ISSUER: shennong-os
@@ -46,7 +46,7 @@ services:
           "profiles": [
             {
               "name": "cpu-small",
-              "image": "${SHENNONG_WORKER_IMAGE:?set a digest-pinned worker image}",
+              "image": "${SHENNONG_WORKER_IMAGE:-zerostwo/shennong-runtime-worker:latest}",
               "kind": "batch",
               "max_resources": {
                 "cpus": 2.0,
@@ -61,7 +61,7 @@ services:
             },
             {
               "name": "ide-small",
-              "image": "${SHENNONG_IDE_IMAGE:?set a digest-pinned IDE image}",
+              "image": "${SHENNONG_IDE_IMAGE:-zerostwo/shennong-runtime-ide:latest}",
               "kind": "ide",
               "max_resources": {
                 "cpus": 4.0,

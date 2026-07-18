@@ -13,7 +13,8 @@ holder can administer every container and volume owned by that daemon.
 
 - a dedicated Linux user with rootless Docker and cgroup v2/systemd delegation;
 - a private OS/DB control bridge with a dedicated host-side gateway address;
-- digest-pinned daemon, worker, and IDE images;
+- daemon, worker, and IDE images pulled from Docker Hub (immutable digest
+  overrides are strongly recommended for production);
 - an Ed25519 verification public key issued by Shennong OS;
 - root access to install the narrow systemd/nftables policy reconciler; Runtime
   itself remains unprivileged and never receives network-administration caps.
@@ -65,12 +66,23 @@ SHENNONG_RUNTIME_CONTROL_URL=http://172.30.0.1:7000/v1/health \
 Then supply all required Compose variables and start the daemon:
 
 ```bash
+cp deployments/docker/.env.example deployments/docker/.env
 export SHENNONG_ROOTLESSKIT_STATE_DIR=/run/user/1001/shennong-runtime-rootlesskit
 export SHENNONG_EGRESS_POLICY_STATE_DIR=/run/shennong-runtime-egress
 export SHENNONG_RUNTIME_PROXY_V4=10.252.0.1/32
-docker compose -f deployments/docker/compose.rootless.yaml config
-docker compose -f deployments/docker/compose.rootless.yaml up -d
+docker compose --env-file deployments/docker/.env \
+  -f deployments/docker/compose.rootless.yaml pull
+docker compose --env-file deployments/docker/.env \
+  -f deployments/docker/compose.rootless.yaml config
+docker compose --env-file deployments/docker/.env \
+  -f deployments/docker/compose.rootless.yaml up -d
 ```
+
+The Compose defaults use `zerostwo/shennong-runtime-{daemon,worker,ide}:latest`.
+Set `SHENNONG_RUNTIME_DAEMON_IMAGE`, `SHENNONG_WORKER_IMAGE`, and
+`SHENNONG_IDE_IMAGE` to immutable `repository@sha256:...` references for a
+reproducible production deployment. Worker and IDE images must also be pulled
+through the dedicated rootless Docker socket before Runtime launches workloads.
 
 Ed25519 verification is the V1 production default and mounts only a public key.
 The `compose.hs256.yaml` override is retained solely for rollback compatibility
