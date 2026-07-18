@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::{JwtVerifier, Principal},
-    config::{ExecutorKind, RuntimeConfig},
+    config::{DockerMode, ExecutorKind, RuntimeConfig},
     error::{Result, RuntimeError},
     executor::{DockerExecutor, Executor, MockExecutor, workspace_volume_name},
     journal::Journal,
@@ -59,9 +59,8 @@ impl AppState {
                     config.job_network.clone(),
                     config.session_network.clone(),
                     config.runtime_instance_id.clone(),
-                    config.egress_policy.clone().ok_or_else(|| {
-                        RuntimeError::Internal("missing Docker egress policy guard".into())
-                    })?,
+                    config.egress_policy.clone(),
+                    config.docker_mode == DockerMode::Hardened,
                 )
                 .await?,
             ),

@@ -1,4 +1,4 @@
-name: Publish Docker images
+name: Publish Docker image
 
 on:
   push:
@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   publish:
-    name: Publish Runtime images
+    name: Publish Runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -26,6 +26,22 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - name: Generate OCI tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: zerostwo/shennong-runtime
+          flavor: latest=false
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=Shennong Runtime
+            org.opencontainers.image.description=Unified daemon, batch worker, RStudio, and Jupyter Runtime image
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -36,92 +52,20 @@ jobs:
           username: zerostwo
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Generate worker tags and labels
-        id: worker-meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: zerostwo/shennong-runtime-worker
-          flavor: latest=false
-          tags: &release-tags |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=stable,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
-            type=sha,format=long
-          labels: |
-            org.opencontainers.image.title=Shennong Runtime Worker
-            org.opencontainers.image.description=Isolated batch worker for Shennong Runtime
-
-      - name: Build and push worker
-        id: worker
+      - name: Build and push image
+        id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: container/worker.Dockerfile
+          file: container/runtime.Dockerfile
           push: true
           platforms: linux/amd64
-          tags: ${{ steps.worker-meta.outputs.tags }}
-          labels: ${{ steps.worker-meta.outputs.labels }}
-          cache-from: type=gha,scope=runtime-worker
-          cache-to: type=gha,mode=max,scope=runtime-worker
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=shennong-runtime
+          cache-to: type=gha,mode=max,scope=shennong-runtime
           provenance: true
           sbom: true
 
-      - name: Generate daemon tags and labels
-        id: daemon-meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: zerostwo/shennong-runtime-daemon
-          flavor: latest=false
-          tags: *release-tags
-          labels: |
-            org.opencontainers.image.title=Shennong Runtime Daemon
-            org.opencontainers.image.description=Rootless execution-plane daemon for Shennong OS
-
-      - name: Build and push daemon
-        id: daemon
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: container/daemon.Dockerfile
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.daemon-meta.outputs.tags }}
-          labels: ${{ steps.daemon-meta.outputs.labels }}
-          cache-from: type=gha,scope=runtime-daemon
-          cache-to: type=gha,mode=max,scope=runtime-daemon
-          provenance: true
-          sbom: true
-
-      - name: Generate IDE tags and labels
-        id: ide-meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: zerostwo/shennong-runtime-ide
-          flavor: latest=false
-          tags: *release-tags
-          labels: |
-            org.opencontainers.image.title=Shennong Runtime IDE
-            org.opencontainers.image.description=Isolated RStudio and JupyterLab session image for Shennong Runtime
-
-      - name: Build and push IDE
-        id: ide
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        with:
-          context: .
-          file: container/ide.Dockerfile
-          push: true
-          platforms: linux/amd64
-          build-args: WORKER_IMAGE=zerostwo/shennong-runtime-worker@${{ steps.worker.outputs.digest }}
-          tags: ${{ steps.ide-meta.outputs.tags }}
-          labels: ${{ steps.ide-meta.outputs.labels }}
-          cache-from: type=gha,scope=runtime-ide
-          cache-to: type=gha,mode=max,scope=runtime-ide
-          provenance: true
-          sbom: true
-
-      - name: Verify published digests
-        run: |
-          docker buildx imagetools inspect "zerostwo/shennong-runtime-worker@${{ steps.worker.outputs.digest }}"
-          docker buildx imagetools inspect "zerostwo/shennong-runtime-daemon@${{ steps.daemon.outputs.digest }}"
-          docker buildx imagetools inspect "zerostwo/shennong-runtime-ide@${{ steps.ide.outputs.digest }}"
+      - name: Verify published digest
+        run: docker buildx imagetools inspect "zerostwo/shennong-runtime@${{ steps.build.outputs.digest }}"

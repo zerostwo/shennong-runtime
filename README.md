@@ -3,7 +3,8 @@
 Shennong Runtime 1.0.0 is the private execution plane for Shennong OS. It
 implements a Rust/Axum daemon, a SQLite executor journal, a strict
 Job/Session protocol, a mock executor, and a policy-locked Docker executor for
-a **dedicated rootless Docker daemon**.
+a **dedicated rootless Docker daemon**. The same image also supports an explicit
+single-host `simple` mode for the three-container quick deployment.
 
 Shennong OS remains the durable source of truth for users, projects, Jobs,
 Artifacts, and Agent Runs. Runtime's SQLite database is a recovery journal, not
@@ -54,11 +55,12 @@ Enforced by the Rust daemon:
   gateway alone binds to a random host `127.0.0.1` port;
 - scanner container uses `network=none` and a read-only workspace mount.
 
-The daemon refuses `/var/run/docker.sock` and `/run/docker.sock`, then queries
-Docker at startup and fails closed unless it reports rootless mode, seccomp,
-and delegated cgroup v2 CPU/memory/PID controls. Production must use a rootless
-daemon dedicated to Runtime workloads. A rootless daemon shared with OS/DB is
-still unsafe because its socket controls all resources in that daemon.
+Hardened mode refuses `/var/run/docker.sock` and `/run/docker.sock`, then
+queries Docker at startup and fails closed unless it reports rootless mode,
+seccomp, and delegated cgroup v2 CPU/memory/PID controls. Production must use a
+rootless daemon dedicated to Runtime workloads. `simple` mode is opt-in and
+accepts the system socket for a trusted single-user host; possession of that
+socket is equivalent to host-level Docker administration.
 
 Network policy has two layers:
 
@@ -130,10 +132,7 @@ Run the release-quality local checks from the repository root:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets
-docker buildx build --check --file container/daemon.Dockerfile .
-docker buildx build --check --file container/worker.Dockerfile .
-docker buildx build --check --file container/ide.Dockerfile \
-  --build-arg WORKER_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 .
+docker buildx build --check --file container/runtime.Dockerfile .
 docker compose --file deployments/docker/compose.rootless.yaml config --quiet
 bash -n scripts/verify-live-runtime.sh
 shellcheck scripts/verify-live-runtime.sh
@@ -200,23 +199,21 @@ reach rootless IDE loopback ports. It publishes no Compose port and requires an
 explicit private control-bridge listen address; Docker mode rejects `0.0.0.0`
 and public addresses. Shennong OS is the only expected Runtime API client.
 
-## Images
+## Image
 
-One repository deliberately produces separate trust domains:
+`container/runtime.Dockerfile` produces `zerostwo/shennong-runtime`, containing
+the daemon, trusted batch entrypoint/scanner, R, Python, Pixi, RStudio Server,
+and JupyterLab. Runtime selects the role by overriding the entrypoint and
+command for each workload. The older split Dockerfiles remain as migration
+references but are no longer published.
 
-- `container/daemon.Dockerfile`: minimal Rust control-plane daemon;
-- `container/worker.Dockerfile`: R, Python, Pixi and trusted argv/scanner tools;
-- `container/ide.Dockerfile`: worker-derived RStudio Server + JupyterLab image.
-
-Production image profiles must use `repository@sha256:...`. The IDE build
+Production profiles should use one `repository@sha256:...` reference. The image
 defaults to Posit's official RStudio Server `2026.07.0+139` Ubuntu 22 amd64
 package at
 `https://download2.rstudio.org/server/jammy/amd64/rstudio-server-2026.07.0-139-amd64.deb`,
 verified as SHA-256
 `e7b310c9e46811635b8dea8df82c729686c3a78f35cfa7767d9567e30f528465`.
-The checked-in Rust, Debian, and Pixi defaults use reviewed manifest-list
-digests. The IDE Dockerfile has no worker default: every IDE build must provide
-the digest of the exact worker image it extends.
+The checked-in Rust, Node, and Pixi defaults use reviewed manifest-list digests.
 
 ## Session proxying
 

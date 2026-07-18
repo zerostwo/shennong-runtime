@@ -13,8 +13,8 @@ holder can administer every container and volume owned by that daemon.
 
 - a dedicated Linux user with rootless Docker and cgroup v2/systemd delegation;
 - a private OS/DB control bridge with a dedicated host-side gateway address;
-- daemon, worker, and IDE images pulled from Docker Hub (immutable digest
-  overrides are strongly recommended for production);
+- the unified Runtime image pulled from Docker Hub (an immutable digest
+  override is strongly recommended for production);
 - an Ed25519 verification public key issued by Shennong OS;
 - root access to install the narrow systemd/nftables policy reconciler; Runtime
   itself remains unprivileged and never receives network-administration caps.
@@ -78,11 +78,11 @@ docker compose --env-file deployments/docker/.env \
   -f deployments/docker/compose.rootless.yaml up -d
 ```
 
-The Compose defaults use `zerostwo/shennong-runtime-{daemon,worker,ide}:latest`.
-Set `SHENNONG_RUNTIME_DAEMON_IMAGE`, `SHENNONG_WORKER_IMAGE`, and
-`SHENNONG_IDE_IMAGE` to immutable `repository@sha256:...` references for a
-reproducible production deployment. Worker and IDE images must also be pulled
-through the dedicated rootless Docker socket before Runtime launches workloads.
+The Compose default uses `zerostwo/shennong-runtime:latest` for the daemon,
+worker, scanner, and IDE roles. Set `SHENNONG_RUNTIME_IMAGE` to one immutable
+`repository@sha256:...` reference for a reproducible production deployment.
+The same image must also be pulled through the dedicated rootless Docker socket
+before Runtime launches workloads.
 
 Ed25519 verification is the V1 production default and mounts only a public key.
 The `compose.hs256.yaml` override is retained solely for rollback compatibility

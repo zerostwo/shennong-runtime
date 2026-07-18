@@ -21,6 +21,12 @@ pub enum ExecutorKind {
     Docker,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DockerMode {
+    Hardened,
+    Simple,
+}
+
 #[derive(Clone, Debug)]
 pub enum JwtKey {
     Hs256(Vec<u8>),
@@ -43,6 +49,7 @@ pub struct RuntimeConfig {
     pub listen: SocketAddr,
     pub database_url: String,
     pub executor_kind: ExecutorKind,
+    pub docker_mode: DockerMode,
     pub docker_socket: Option<PathBuf>,
     pub job_network: String,
     pub session_network: String,
@@ -81,6 +88,20 @@ impl RuntimeConfig {
             }
         };
 
+        let docker_mode = match env::var("SHENNONG_RUNTIME_DOCKER_MODE")
+            .unwrap_or_else(|_| "hardened".into())
+            .as_str()
+        {
+            "hardened" => DockerMode::Hardened,
+            "simple" => DockerMode::Simple,
+            other => {
+                return Err(RuntimeError::Validation(format!(
+                    "SHENNONG_RUNTIME_DOCKER_MODE must be hardened or simple, got {other}"
+                )));
+            }
+        };
+        let hardened = executor_kind == ExecutorKind::Docker && docker_mode == DockerMode::Hardened;
+
         let docker_socket = env::var_os("SHENNONG_ROOTLESS_DOCKER_SOCKET").map(PathBuf::from);
         if executor_kind == ExecutorKind::Docker {
             let socket = docker_socket.as_ref().ok_or_else(|| {
@@ -88,7 +109,7 @@ impl RuntimeConfig {
                     "SHENNONG_ROOTLESS_DOCKER_SOCKET is required for docker executor".into(),
                 )
             })?;
-            validate_rootless_socket(socket)?;
+            validate_docker_socket(socket, docker_mode)?;
         }
 
         let jwt_key = parse_jwt_key(executor_kind == ExecutorKind::Docker)?;
@@ -104,7 +125,7 @@ impl RuntimeConfig {
         let os_auth_cookie_names =
             parse_os_auth_cookie_names(executor_kind == ExecutorKind::Docker)?;
         let runtime_instance_id = parse_runtime_instance_id(executor_kind == ExecutorKind::Docker)?;
-        let egress_policy = parse_egress_policy(executor_kind == ExecutorKind::Docker)?;
+        let egress_policy = parse_egress_policy(hardened)?;
         let job_network =
             parse_executor_network("SHENNONG_JOB_EGRESS_NETWORK", "shennong-job-egress")?;
         let session_network =
@@ -121,7 +142,7 @@ impl RuntimeConfig {
             .map_err(|error| {
                 RuntimeError::Validation(format!("invalid listen address: {error}"))
             })?;
-        if executor_kind == ExecutorKind::Docker && !is_internal_address(listen.ip()) {
+        if hardened && !is_internal_address(listen.ip()) {
             return Err(RuntimeError::Validation(
                 "docker executor requires an explicit loopback or private control-plane listen address; 0.0.0.0 and public addresses are forbidden"
                     .into(),
@@ -133,6 +154,7 @@ impl RuntimeConfig {
             database_url: env::var("SHENNONG_RUNTIME_DATABASE_URL")
                 .unwrap_or_else(|_| "sqlite://runtime.db?mode=rwc".into()),
             executor_kind,
+            docker_mode,
             docker_socket,
             job_network,
             session_network,
@@ -165,6 +187,7 @@ impl RuntimeConfig {
             listen: "127.0.0.1:0".parse().expect("test address"),
             database_url,
             executor_kind: ExecutorKind::Mock,
+            docker_mode: DockerMode::Hardened,
             docker_socket: None,
             job_network: "shennong-job-egress".into(),
             session_network: "shennong-session-proxy".into(),
@@ -385,15 +408,15 @@ fn is_internal_address(address: std::net::IpAddr) -> bool {
     }
 }
 
-fn validate_rootless_socket(path: &std::path::Path) -> Result<()> {
+fn validate_docker_socket(path: &std::path::Path, mode: DockerMode) -> Result<()> {
     let text = path.to_string_lossy();
     if !path.is_absolute()
         || !text.ends_with("docker.sock")
-        || text == "/var/run/docker.sock"
-        || text == "/run/docker.sock"
+        || (mode == DockerMode::Hardened
+            && matches!(text.as_ref(), "/var/run/docker.sock" | "/run/docker.sock"))
     {
         return Err(RuntimeError::Validation(
-            "docker executor requires an absolute dedicated rootless docker.sock; the system socket is forbidden"
+            "docker executor requires an absolute docker.sock path; hardened mode forbids the system socket"
                 .into(),
         ));
     }
@@ -480,13 +503,13 @@ fn default_mock_profiles() -> HashMap<String, WorkerProfile> {
     [
         WorkerProfile {
             name: "cpu-small".into(),
-            image: format!("zerostwo/shennong-runtime-worker@{MOCK_DIGEST}"),
+            image: format!("zerostwo/shennong-runtime@{MOCK_DIGEST}"),
             kind: crate::model::WorkerKind::Batch,
             max_resources: ResourceLimits::default_batch(),
         },
         WorkerProfile {
             name: "ide-small".into(),
-            image: format!("zerostwo/shennong-runtime-ide@{MOCK_DIGEST}"),
+            image: format!("zerostwo/shennong-runtime@{MOCK_DIGEST}"),
             kind: crate::model::WorkerKind::Ide,
             max_resources: ResourceLimits::default_session(),
         },
@@ -498,7 +521,23 @@ fn default_mock_profiles() -> HashMap<String, WorkerProfile> {
 
 #[cfg(test)]
 mod tests {
-    use super::trim_secret_line_endings;
+    use std::path::Path;
+
+    use super::{DockerMode, trim_secret_line_endings, validate_docker_socket};
+
+    #[test]
+    fn system_socket_requires_explicit_simple_mode() {
+        let socket = Path::new("/var/run/docker.sock");
+        assert!(validate_docker_socket(socket, DockerMode::Hardened).is_err());
+        assert!(validate_docker_socket(socket, DockerMode::Simple).is_ok());
+        assert!(
+            validate_docker_socket(
+                Path::new("/run/user/1001/shennong-runtime/docker.sock"),
+                DockerMode::Hardened,
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn trims_only_trailing_secret_line_endings() {

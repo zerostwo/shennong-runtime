@@ -2,7 +2,7 @@ name: shennong-runtime
 
 services:
   runtime:
-    image: ${SHENNONG_RUNTIME_DAEMON_IMAGE:-zerostwo/shennong-runtime-daemon:latest}
+    image: ${SHENNONG_RUNTIME_IMAGE:-zerostwo/shennong-runtime:latest}
     container_name: shennong-runtime
     restart: unless-stopped
     user: "${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}:${SHENNONG_RUNTIME_GID:?set the rootless Docker owner GID}"
@@ -46,7 +46,7 @@ services:
           "profiles": [
             {
               "name": "cpu-small",
-              "image": "${SHENNONG_WORKER_IMAGE:-zerostwo/shennong-runtime-worker:latest}",
+              "image": "${SHENNONG_RUNTIME_IMAGE:-zerostwo/shennong-runtime:latest}",
               "kind": "batch",
               "max_resources": {
                 "cpus": 2.0,
@@ -61,7 +61,7 @@ services:
             },
             {
               "name": "ide-small",
-              "image": "${SHENNONG_IDE_IMAGE:-zerostwo/shennong-runtime-ide:latest}",
+              "image": "${SHENNONG_RUNTIME_IMAGE:-zerostwo/shennong-runtime:latest}",
               "kind": "ide",
               "max_resources": {
                 "cpus": 4.0,

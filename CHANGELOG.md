@@ -9,15 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Publish daemon, worker, and IDE images to Docker Hub from `main`, version
-  tags, and manual GitHub Actions runs; the IDE is built from the exact worker
-  digest produced by the same run.
+- Publish one `zerostwo/shennong-runtime` image that can run the daemon, batch
+  jobs, RStudio, and JupyterLab sessions.
+- Add an explicit `simple` Docker mode for the three-container single-host
+  deployment while retaining hardened rootless mode as the default.
 
 ### Changed
 
-- Default Docker Compose to the public `zerostwo/shennong-runtime-*` images and
-  built-in stable network values while retaining immutable image overrides for
-  production rollbacks.
+- Use the same unified Runtime image for daemon, worker, scanner, and IDE
+  containers, including the hardened rootless Compose profile.
+- Default Docker Compose to the public unified Runtime image and built-in stable
+  network values while retaining an immutable image override for production
+  rollbacks.
 
 ### Fixed
 

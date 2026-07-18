@@ -20,7 +20,7 @@ use bollard::{
         HostConfig, Mount, MountTypeEnum, MountVolumeOptions, Network, PortBinding,
         SystemInfoCgroupVersionEnum,
     },
-    network::InspectNetworkOptions,
+    network::{CreateNetworkOptions, InspectNetworkOptions},
     volume::CreateVolumeOptions,
 };
 use bytes::Bytes;
@@ -336,7 +336,8 @@ pub struct DockerExecutor {
     job_network: String,
     session_network: String,
     instance_id: String,
-    egress_policy: EgressPolicyGuard,
+    egress_policy: Option<EgressPolicyGuard>,
+    hardened: bool,
 }
 
 impl DockerExecutor {
@@ -345,10 +346,16 @@ impl DockerExecutor {
         job_network: String,
         session_network: String,
         instance_id: String,
-        egress_policy: EgressPolicyConfig,
+        egress_policy: Option<EgressPolicyConfig>,
+        hardened: bool,
     ) -> Result<Self> {
-        let egress_policy = EgressPolicyGuard::from(egress_policy);
-        egress_policy.verify()?;
+        let egress_policy = egress_policy.map(EgressPolicyGuard::from);
+        if hardened {
+            egress_policy
+                .as_ref()
+                .ok_or_else(|| RuntimeError::Internal("missing Docker egress policy guard".into()))?
+                .verify()?;
+        }
         let socket = socket
             .to_str()
             .ok_or_else(|| RuntimeError::Validation("docker socket path is not UTF-8".into()))?;
@@ -356,9 +363,10 @@ impl DockerExecutor {
             .map_err(|error| RuntimeError::Executor(error.to_string()))?;
         let info = docker.info().await.map_err(executor_error)?;
         let security_options = info.security_options.unwrap_or_default();
-        if !security_options
-            .iter()
-            .any(|option| option.split(',').any(|part| part == "name=rootless"))
+        if hardened
+            && !security_options
+                .iter()
+                .any(|option| option.split(',').any(|part| part == "name=rootless"))
         {
             return Err(RuntimeError::Validation(
                 "the configured workload Docker daemon does not report rootless mode".into(),
@@ -388,7 +396,16 @@ impl DockerExecutor {
             session_network,
             instance_id,
             egress_policy,
+            hardened,
         };
+        if !executor.hardened {
+            executor
+                .ensure_simple_network(&executor.job_network, false)
+                .await?;
+            executor
+                .ensure_simple_network(&executor.session_network, false)
+                .await?;
+        }
         executor.verify_launch_policy().await?;
         Ok(executor)
     }
@@ -402,20 +419,67 @@ impl DockerExecutor {
     }
 
     async fn verify_launch_policy(&self) -> Result<()> {
-        self.egress_policy.verify()?;
+        if !self.hardened {
+            let job = self.inspect_managed_network(&self.job_network).await?;
+            let session = self.inspect_managed_network(&self.session_network).await?;
+            validate_simple_network(&job, &self.job_network)?;
+            validate_simple_network(&session, &self.session_network)?;
+            if job.id.is_none() || job.id == session.id {
+                return Err(RuntimeError::Executor(
+                    "Job and Session executor networks must have distinct Docker IDs".into(),
+                ));
+            }
+            return Ok(());
+        }
+        let egress_policy = self
+            .egress_policy
+            .as_ref()
+            .ok_or_else(|| RuntimeError::Internal("missing Docker egress policy guard".into()))?;
+        egress_policy.verify()?;
         let job = self.inspect_managed_network(&self.job_network).await?;
         let session = self.inspect_managed_network(&self.session_network).await?;
-        validate_managed_network(&job, &self.job_network, &self.egress_policy.job_bridge)?;
+        validate_managed_network(&job, &self.job_network, &egress_policy.job_bridge)?;
         validate_managed_network(
             &session,
             &self.session_network,
-            &self.egress_policy.session_bridge,
+            &egress_policy.session_bridge,
         )?;
         if job.id.is_none() || job.id == session.id {
             return Err(RuntimeError::Executor(
                 "Job and Session executor networks must have distinct Docker IDs".into(),
             ));
         }
+        Ok(())
+    }
+
+    async fn ensure_simple_network(&self, name: &str, internal: bool) -> Result<()> {
+        if self
+            .docker
+            .inspect_network(name, None::<InspectNetworkOptions<String>>)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.docker
+            .create_network(CreateNetworkOptions {
+                name: name.to_string(),
+                check_duplicate: true,
+                driver: "bridge".to_string(),
+                internal,
+                attachable: false,
+                ingress: false,
+                labels: HashMap::from([
+                    ("dev.shennong.managed".to_string(), "true".to_string()),
+                    (
+                        "dev.shennong.network-policy".to_string(),
+                        "simple".to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            })
+            .await
+            .map_err(executor_error)?;
         Ok(())
     }
 
@@ -897,6 +961,10 @@ impl Executor for DockerExecutor {
             .map_err(|error| RuntimeError::Internal(error.to_string()))?;
         let config = ContainerConfig {
             image: Some(job.profile.image.clone()),
+            entrypoint: Some(vec![
+                "python3".into(),
+                "/opt/shennong/bin/job_entrypoint.py".into(),
+            ]),
             cmd: Some(resolved_job_argv(&self.instance_id, job)?),
             env: Some(vec![
                 format!("SHENNONG_JOB_ID={}", job.id),
@@ -1080,7 +1148,6 @@ impl Executor for DockerExecutor {
         let mut labels = self.managed_labels("session");
         labels.insert("dev.shennong.session_id".into(), session.id.to_string());
         let proxy_path = format!("/v1/sessions/{}/proxy", session.id);
-        let command = vec!["python3".into(), "/opt/shennong/bin/launch_ide.py".into()];
         let container_port = format!("{IDE_GATEWAY_PORT}/tcp");
         let mut host_config = self.locked_host_config(
             &self.session_network,
@@ -1098,7 +1165,11 @@ impl Executor for DockerExecutor {
         )]));
         let config = ContainerConfig {
             image: Some(session.profile.image.clone()),
-            cmd: Some(command),
+            entrypoint: Some(vec![
+                "python3".into(),
+                "/opt/shennong/bin/launch_ide.py".into(),
+            ]),
+            cmd: Some(Vec::new()),
             env: Some(vec![
                 format!(
                     "SHENNONG_IDE_KIND={}",
@@ -1335,6 +1406,29 @@ fn validate_managed_network(network: &Network, expected_name: &str, bridge: &str
     {
         return Err(RuntimeError::Executor(format!(
             "Docker network {expected_name} is not the attested managed bridge {bridge}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_simple_network(network: &Network, expected_name: &str) -> Result<()> {
+    let labels = network.labels.as_ref();
+    if network.name.as_deref() != Some(expected_name)
+        || network.driver.as_deref() != Some("bridge")
+        || network.scope.as_deref() != Some("local")
+        || network.ingress == Some(true)
+        || network.config_only == Some(true)
+        || labels
+            .and_then(|values| values.get("dev.shennong.managed"))
+            .map(String::as_str)
+            != Some("true")
+        || labels
+            .and_then(|values| values.get("dev.shennong.network-policy"))
+            .map(String::as_str)
+            != Some("simple")
+    {
+        return Err(RuntimeError::Executor(format!(
+            "Docker network {expected_name} is not a Shennong simple-mode bridge"
         )));
     }
     Ok(())

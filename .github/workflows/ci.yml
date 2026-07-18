@@ -63,9 +63,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
-      SHENNONG_RUNTIME_DAEMON_IMAGE: example.invalid/shennong-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
-      SHENNONG_WORKER_IMAGE: example.invalid/shennong-worker@sha256:1111111111111111111111111111111111111111111111111111111111111111
-      SHENNONG_IDE_IMAGE: example.invalid/shennong-ide@sha256:2222222222222222222222222222222222222222222222222222222222222222
+      SHENNONG_RUNTIME_IMAGE: example.invalid/shennong-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
       SHENNONG_RUNTIME_UID: "1000"
       SHENNONG_RUNTIME_GID: "1000"
       SHENNONG_RUNTIME_LISTEN: 127.0.0.1:7000
@@ -85,10 +83,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Check Dockerfiles without building images
-        run: |
-          docker buildx build --check --file container/daemon.Dockerfile .
-          docker buildx build --check --file container/worker.Dockerfile .
-          docker buildx build --check --file container/ide.Dockerfile --build-arg WORKER_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 .
+        run: docker buildx build --check --file container/runtime.Dockerfile .
 
       - name: Validate production Compose expansion
         run: docker compose --file deployments/docker/compose.rootless.yaml config --quiet
