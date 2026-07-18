@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default Docker Compose to the public unified Runtime image and built-in stable
   network values while retaining an immutable image override for production
   rollbacks.
+- Document the implemented trust boundaries, component responsibilities, state
+  ownership, Job/Session lifecycles, deployment modes, residual risks and
+  cross-repository contracts, with a visual architecture map in the README and
+  repository-specific agent guidance.
 
 ### Fixed
 

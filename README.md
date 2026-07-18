@@ -10,6 +10,58 @@ Shennong OS remains the durable source of truth for users, projects, Jobs,
 Artifacts, and Agent Runs. Runtime's SQLite database is a recovery journal, not
 a second product database.
 
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    subgraph User["User boundary"]
+        Browser["Browser"]
+    end
+
+    subgraph Control["Trusted services"]
+        OS["shennong-os<br/>UI, agent, product state, JWT issuer"]
+        DB["shennong-db<br/>Biomedical catalog and query"]
+        Runtime["Runtime daemon<br/>API, policy, supervision"]
+        Journal[("SQLite recovery journal")]
+    end
+
+    subgraph Executor["Workload Docker executor"]
+        Job["Batch Job<br/>Untrusted R, Python, Pixi"]
+        Scanner["Artifact scanner<br/>Network disabled"]
+        Gateway["Per-Session gateway<br/>Secret-authenticated"]
+        IDE["RStudio or JupyterLab<br/>Container loopback only"]
+        Workspace[("Project workspace volume")]
+    end
+
+    Browser -->|"AG-UI and HTTPS"| OS
+    OS -->|"Biomedical data API"| DB
+    OS -->|"Short-lived JWT over private API"| Runtime
+    Runtime --> Journal
+    Runtime -->|"Configured Docker API socket"| Job
+    Runtime -->|"Configured Docker API socket"| Gateway
+    Job <-->|"Read and write"| Workspace
+    Runtime -.->|"Post-exit scan"| Scanner
+    Scanner -->|"Read only"| Workspace
+    Gateway --> IDE
+    OS -->|"Authenticated IDE proxy"| Runtime
+    Runtime -->|"HTTP and WebSocket with internal secret"| Gateway
+```
+
+The trust split is deliberate: OS owns user-facing and durable product
+state; DB owns biomedical catalog/query data; Runtime alone owns executor
+coordination and the configured workload socket. Hardened production uses a
+dedicated rootless daemon; opt-in `simple` mode accepts the lower-assurance
+system-daemon boundary for a trusted single-user host. Workload code is
+untrusted and never receives a host path, Docker socket, control-plane
+credential, or direct IDE port. Runtime and DB do not require a direct
+service-to-service link.
+
+See [Architecture and design](docs/architecture.md) for component
+responsibilities, state ownership, Job and Session lifecycles, deployment
+modes, security risks, non-goals, and cross-repository contracts. The exact
+wire contract remains [protocol/openapi.yaml](protocol/openapi.yaml), while
+[SECURITY.md](SECURITY.md) defines the production acceptance boundary.
+
 ## Implemented API
 
 - `GET /v1/health`, `GET /v1/info`
@@ -62,7 +114,7 @@ rootless daemon dedicated to Runtime workloads. `simple` mode is opt-in and
 accepts the system socket for a trusted single-user host; possession of that
 socket is equivalent to host-level Docker administration.
 
-Network policy has two layers:
+Hardened network policy has two layers:
 
 1. the executor attaches batch Jobs only to `shennong-job-egress` and publishes
    no ports;
@@ -126,6 +178,22 @@ shell rejection, logs, Artifacts, IDE target redaction, HTTP proxying, and
 WebSocket proxying. Unit tests also inspect the staged tar contract, including
 private file modes and the per-Job input root.
 
+## Simple single-host mode
+
+The unified `zerostwo/shennong-runtime` image also supports the top-level
+three-container quick deployment by setting
+`SHENNONG_RUNTIME_DOCKER_MODE=simple`. This mode may use the trusted host's
+system Docker socket and creates two labeled bridge networks when absent. It
+retains Runtime-built non-root containers, seccomp/cgroup checks, resource
+limits and separate Job/Session networks, but it does **not** require rootless
+mode, the root-owned nftables attestation, or a private listen address.
+
+`simple` is therefore a convenience profile for a trusted single-user host,
+not the hardened production acceptance profile. The Docker socket grants
+daemon-wide administration, and `internet_only` does not have the hardened
+mode's attested private-destination filtering. Use the rootless profile below
+for hostile or multi-user workloads.
+
 Run the release-quality local checks from the repository root:
 
 ```bash
@@ -150,7 +218,7 @@ shellcheck scripts/verify-live-runtime.sh
 5. Run `bash scripts/verify-egress-policy.sh` with a digest-pinned Python image
    and a live private Runtime health URL. The verification requires IDE-to-
    control-plane denial as well as host-to-IDE proxy reachability.
-6. Supply digest-pinned daemon/worker/IDE image variables and validate
+6. Supply one digest-pinned `SHENNONG_RUNTIME_IMAGE` and validate
    `deployments/docker/compose.rootless.yaml` with `docker compose config`.
 7. After the final images are deployed, run the live Runtime acceptance gate
    from a trusted host that can reach the private API:
@@ -241,7 +309,7 @@ Runtime strips the OS bearer token and untrusted forwarding/RStudio headers,
 then rewrites Origin/Referer after OS validation. It revokes already-established
 HTTP/WebSocket streams at terminal state, records throttled bidirectional proxy
 activity for atomic idle expiry, and independently enforces absolute Session
-TTL. IDE images use the same proxy base path so redirects and WebSocket URLs
+TTL. The IDE role uses the same proxy base path so redirects and WebSocket URLs
 stay routable. The dedicated rootless executor account and its Docker socket
 remain trusted infrastructure credentials.
 
