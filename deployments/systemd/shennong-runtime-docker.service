@@ -1,0 +1,36 @@
+[Unit]
+Description=Dedicated rootless Docker daemon for Shennong Runtime workloads
+Documentation=https://docs.docker.com/engine/security/rootless/
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+# dockerd-rootless.sh launches dockerd as a child; accept its READY=1 notification.
+NotifyAccess=all
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=DOCKERD_ROOTLESS_ROOTLESSKIT_STATE_DIR=%t/shennong-runtime-rootlesskit
+ExecStartPre=/usr/bin/mkdir -p %t/shennong-runtime-docker %h/.local/share/shennong-runtime-docker
+ExecStart=/usr/bin/dockerd-rootless.sh \
+  --host=unix://%t/shennong-runtime-docker/docker.sock \
+  --data-root=%h/.local/share/shennong-runtime-docker/data \
+  --exec-root=%t/shennong-runtime-docker/exec \
+  --pidfile=%t/shennong-runtime-docker/dockerd.pid \
+  --live-restore=false \
+  --no-new-privileges=true \
+  --log-driver=json-file \
+  --log-opt=max-size=10m \
+  --log-opt=max-file=3
+Restart=always
+RestartSec=2
+TimeoutStartSec=0
+TimeoutStopSec=30
+KillMode=process
+Delegate=yes
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+UMask=0077
+
+[Install]
+WantedBy=default.target

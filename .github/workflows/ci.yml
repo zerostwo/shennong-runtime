@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  openapi:
+    name: OpenAPI contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install pinned OpenAPI validator
+        run: python3 -m pip install --disable-pip-version-check openapi-spec-validator==0.7.2
+      - name: Validate Runtime API contract
+        run: openapi-spec-validator protocol/openapi.yaml
+
+  rust:
+    name: Rust daemon
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@35a842e360814583e976785eeda0bd0655cb8e83 # 1.97.0
+        with:
+          components: clippy,rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --all-targets
+
+      - name: Audit dependencies
+        # sqlx records optional MySQL RSA crates in Cargo.lock, but this Runtime
+        # enables SQLite only and `cargo tree --target all -i rsa` has no enabled path.
+        run: cargo install cargo-audit --locked && cargo audit --ignore RUSTSEC-2023-0071
+
+  container-contracts:
+    name: Container contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SHENNONG_RUNTIME_DAEMON_IMAGE: example.invalid/shennong-runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      SHENNONG_WORKER_IMAGE: example.invalid/shennong-worker@sha256:1111111111111111111111111111111111111111111111111111111111111111
+      SHENNONG_IDE_IMAGE: example.invalid/shennong-ide@sha256:2222222222222222222222222222222222222222222222222222222222222222
+      SHENNONG_RUNTIME_UID: "1000"
+      SHENNONG_RUNTIME_GID: "1000"
+      SHENNONG_RUNTIME_LISTEN: 127.0.0.1:7000
+      SHENNONG_RUNTIME_INSTANCE_ID: ci-runtime
+      SHENNONG_RUNTIME_PROXY_V4: 10.252.0.1/32
+      SHENNONG_OS_AUTH_COOKIE_NAMES: shennong_session
+      SHENNONG_ROOTLESS_DOCKER_SOCKET: /tmp/shennong-runtime-docker.sock
+      SHENNONG_ROOTLESSKIT_STATE_DIR: /tmp/shennong-rootlesskit
+      SHENNONG_OS_JWT_PUBLIC_KEY_FILE: /tmp/shennong-os-jwt-public-key.pem
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Check Dockerfiles without building images
+        run: |
+          docker buildx build --check --file container/daemon.Dockerfile .
+          docker buildx build --check --file container/worker.Dockerfile .
+          docker buildx build --check --file container/ide.Dockerfile --build-arg WORKER_IMAGE=debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 .
+
+      - name: Validate production Compose expansion
+        run: docker compose --file deployments/docker/compose.rootless.yaml config --quiet
+
+      - name: Check helper source syntax
+        run: |
+          bash -n scripts/*.sh
+          python3 -c "import ast, pathlib; [ast.parse(path.read_text()) for path in pathlib.Path('container').rglob('*.py')]"
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan repository history
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

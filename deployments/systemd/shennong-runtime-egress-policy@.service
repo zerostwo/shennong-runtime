@@ -1,0 +1,39 @@
+[Unit]
+Description=Restore Shennong Runtime egress policy for rootless UID %i
+Documentation=file:///usr/local/libexec/shennong-runtime/reconcile-egress-policy.sh
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=SHENNONG_ROOTLESSKIT_STATE_DIR=/run/user/%i/shennong-runtime-rootlesskit
+Environment=SHENNONG_EGRESS_POLICY_STATE_DIR=/run/shennong-runtime-egress
+Environment=SHENNONG_POLICY_INSTALLER=/usr/local/libexec/shennong-runtime/install-egress-policy.sh
+EnvironmentFile=/etc/shennong-runtime/egress-policy-%i.env
+ExecStart=/usr/local/libexec/shennong-runtime/reconcile-egress-policy.sh %i
+TimeoutStartSec=90
+Restart=on-failure
+RestartSec=5
+UMask=0022
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=read-only
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+ReadWritePaths=/run/shennong-runtime-egress
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

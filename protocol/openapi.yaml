@@ -1,0 +1,470 @@
+openapi: 3.1.0
+info:
+  title: Shennong Runtime API
+  version: 1.0.0
+  description: >-
+    Private execution-plane API. Shennong OS is the durable source of truth;
+    this service owns only executor coordination and its SQLite recovery journal.
+servers:
+  - url: http://runtime:7000
+    description: Internal control network only
+tags:
+  - name: system
+  - name: jobs
+  - name: sessions
+paths:
+  /v1/health:
+    get:
+      tags: [system]
+      operationId: health
+      responses:
+        "200":
+          description: Runtime, journal, executor, and current egress-policy attestation are healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "500":
+          $ref: "#/components/responses/Error"
+        "503":
+          $ref: "#/components/responses/Error"
+  /v1/info:
+    get:
+      tags: [system]
+      operationId: info
+      responses:
+        "200":
+          description: Non-secret runtime capabilities
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Info"
+  /v1/jobs:
+    post:
+      tags: [jobs]
+      operationId: submitJob
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobSpec"
+      responses:
+        "202":
+          description: Accepted, or the identical existing idempotent request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/jobs/{id}:
+    get:
+      tags: [jobs]
+      operationId: getJob
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Job state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      operationId: cancelJob
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Current terminal state; repeated cancellation is idempotent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/jobs/{id}/logs:
+    get:
+      tags: [jobs]
+      operationId: getJobLogs
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        "200":
+          description: Cursor page; Job.log_truncated reports total log truncation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogPage"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/jobs/{id}/artifacts:
+    get:
+      tags: [jobs]
+      operationId: getJobArtifacts
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Validated artifact manifest; never returns host paths
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [artifacts]
+                properties:
+                  artifacts:
+                    type: array
+                    maxItems: 256
+                    items: { $ref: "#/components/schemas/Artifact" }
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/sessions:
+    post:
+      tags: [sessions]
+      operationId: startSession
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionSpec"
+      responses:
+        "202":
+          description: Session started; proxy_path is the only browser data path
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "409":
+          $ref: "#/components/responses/Error"
+        "429":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}:
+    get:
+      tags: [sessions]
+      operationId: getSession
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Session state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/stop:
+    post:
+      tags: [sessions]
+      operationId: stopSession
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+      responses:
+        "200":
+          description: Current terminal state; repeated stop is idempotent
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Session"
+        "404":
+          $ref: "#/components/responses/Error"
+  /v1/sessions/{id}/proxy/{path}:
+    parameters:
+      - $ref: "#/components/parameters/ResourceId"
+      - name: path
+        in: path
+        required: true
+        schema: { type: string }
+        description: Wildcard remainder below the IDE base path.
+    get:
+      tags: [sessions]
+      operationId: proxySessionGet
+      description: >-
+        JWT/owner-authorized streaming HTTP or WebSocket proxy. Runtime strips
+        the OS Authorization header and dials only its journaled 127.0.0.1 target.
+      security: [{ bearerAuth: [] }]
+      responses:
+        default:
+          description: Upstream IDE response or WebSocket upgrade
+    post:
+      tags: [sessions]
+      operationId: proxySessionPost
+      description: Streaming request proxy for IDE forms and APIs.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        default:
+          description: Upstream IDE response
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Short-lived OS-issued JWT. Runtime validates algorithm, signature, issuer,
+        audience=shennong-runtime, exp, iat, optional nbf, maximum TTL, exact
+        scopes and exact workspace_refs.
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: "^[A-Za-z0-9_.:-]+$"
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Error:
+      description: Stable machine-readable error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status, journal, executor]
+      properties:
+        status: { type: string, const: ok }
+        journal: { type: string, const: ok }
+        executor: { type: string }
+    Info:
+      type: object
+      additionalProperties: false
+      required: [service, version, api_versions, executor, worker_profiles, network_policy]
+      properties:
+        service: { type: string, const: shennong-runtime }
+        version: { type: string }
+        api_versions:
+          type: array
+          items: { type: string, const: shennong.dev/v1 }
+        executor: { type: string }
+        worker_profiles:
+          type: array
+          items: { type: string }
+        network_policy: { type: string, const: internet_only }
+    ResourceLimits:
+      type: object
+      additionalProperties: false
+      required: [cpus, memory_bytes, pids, timeout_seconds, tmpfs_bytes, max_log_bytes, max_artifact_bytes, max_workspace_bytes]
+      properties:
+        cpus: { type: number, exclusiveMinimum: 0 }
+        memory_bytes: { type: integer, format: int64, minimum: 67108864 }
+        pids: { type: integer, format: int64, minimum: 16 }
+        timeout_seconds: { type: integer, format: int64, minimum: 1 }
+        tmpfs_bytes: { type: integer, format: int64, minimum: 16777216 }
+        max_log_bytes: { type: integer, format: int64, minimum: 1024 }
+        max_artifact_bytes: { type: integer, format: int64, minimum: 1024 }
+        max_workspace_bytes:
+          type: integer
+          format: int64
+          minimum: 67108864
+          description: Fail-closed supervised ceiling for total named-workspace volume usage.
+      description: Requested limits are accepted only when below the server-side profile ceiling.
+    ArtifactRule:
+      type: object
+      additionalProperties: false
+      required: [path, kind]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Glob relative to /workspace; absolute and parent paths are rejected.
+        kind: { $ref: "#/components/schemas/ArtifactKind" }
+    ArtifactKind:
+      type: string
+      enum: [figure, image, table, report, notebook, script, dataset_subset, archive, other]
+    WorkspaceFile:
+      type: object
+      additionalProperties: false
+      required: [path, content, sha256]
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Project-relative UTF-8 input path staged below a per-Job private workspace directory.
+        content:
+          type: string
+          maxLength: 1048576
+        sha256:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+    JobSpec:
+      type: object
+      additionalProperties: false
+      required: [api_version, workspace_ref, worker_profile, argv, resources, network, artifact_rules]
+      properties:
+        api_version: { type: string, const: shennong.dev/v1 }
+        workspace_ref:
+          type: string
+          minLength: 8
+          maxLength: 128
+          pattern: "^ws_[A-Za-z0-9_-]+$"
+          description: Opaque reference authorized by the JWT; never a host path or Docker volume name.
+        worker_profile:
+          type: string
+          description: Server-side profile name; callers cannot submit an image reference.
+        argv:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items: { type: string, minLength: 1, maxLength: 8192 }
+          description: Direct executable argv. Shell executables are rejected.
+        resources: { $ref: "#/components/schemas/ResourceLimits" }
+        network: { type: string, const: internet_only }
+        workspace_files:
+          type: array
+          maxItems: 32
+          description: OS-resolved governed Project files; total UTF-8 payload is capped at 1 MiB and digests are verified.
+          items: { $ref: "#/components/schemas/WorkspaceFile" }
+        artifact_rules:
+          type: array
+          maxItems: 64
+          items: { $ref: "#/components/schemas/ArtifactRule" }
+    Job:
+      type: object
+      additionalProperties: false
+      required: [id, state, workspace_ref, worker_profile, attempt, log_truncated, created_at, updated_at]
+      properties:
+        id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [queued, preparing, running, cancel_requested, succeeded, failed, cancelled, timed_out, lost]
+        workspace_ref: { type: string }
+        worker_profile: { type: string }
+        attempt: { type: integer, minimum: 1 }
+        exit_code: { type: [integer, "null"], format: int64 }
+        error: { type: [string, "null"] }
+        log_truncated: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    LogEntry:
+      type: object
+      additionalProperties: false
+      required: [cursor, stream, message, created_at]
+      properties:
+        cursor: { type: integer, format: int64, minimum: 1 }
+        stream: { type: string, enum: [stdout, stderr, system] }
+        message: { type: string }
+        created_at: { type: string, format: date-time }
+    LogPage:
+      type: object
+      additionalProperties: false
+      required: [entries, next_cursor]
+      properties:
+        entries:
+          type: array
+          maxItems: 200
+          items: { $ref: "#/components/schemas/LogEntry" }
+        next_cursor: { type: integer, format: int64, minimum: 0 }
+    Artifact:
+      type: object
+      additionalProperties: false
+      required: [id, relative_path, kind, size_bytes, sha256, media_type]
+      properties:
+        id: { type: string, format: uuid }
+        relative_path: { type: string }
+        kind: { $ref: "#/components/schemas/ArtifactKind" }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        sha256: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
+        media_type: { type: [string, "null"] }
+    SessionSpec:
+      type: object
+      additionalProperties: false
+      required: [api_version, workspace_ref, worker_profile, kind, resources, network, idle_timeout_seconds, max_lifetime_seconds]
+      properties:
+        api_version: { type: string, const: shennong.dev/v1 }
+        workspace_ref:
+          type: string
+          pattern: "^ws_[A-Za-z0-9_-]+$"
+        worker_profile:
+          type: string
+          description: Server-side IDE profile name.
+        kind: { type: string, enum: [rstudio, jupyterlab] }
+        resources: { $ref: "#/components/schemas/ResourceLimits" }
+        network: { type: string, const: internet_only }
+        idle_timeout_seconds:
+          type: integer
+          minimum: 300
+          maximum: 28800
+          description: Atomic expiry deadline refreshed by throttled bidirectional Runtime proxy activity.
+        max_lifetime_seconds: { type: integer, minimum: 300 }
+    Session:
+      type: object
+      additionalProperties: false
+      required: [id, state, workspace_ref, kind, created_at, updated_at, expires_at]
+      properties:
+        id: { type: string, format: uuid }
+        state: { type: string, enum: [starting, running, stop_requested, stopped, failed, expired, lost] }
+        workspace_ref: { type: string }
+        kind: { type: string, enum: [rstudio, jupyterlab] }
+        proxy_path:
+          type: [string, "null"]
+          description: Authenticated Runtime proxy path; the loopback target is never serialized.
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        error: { type: [string, "null"] }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, retryable]
+          properties:
+            code: { type: string }
+            message: { type: string }
+            retryable: { type: boolean }

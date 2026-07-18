@@ -1,0 +1,115 @@
+name: shennong-runtime
+
+services:
+  runtime:
+    image: ${SHENNONG_RUNTIME_DAEMON_IMAGE:?set a digest-pinned daemon image}
+    container_name: shennong-runtime
+    restart: unless-stopped
+    user: "${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}:${SHENNONG_RUNTIME_GID:?set the rootless Docker owner GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    environment:
+      # Bind only the host-side Shennong control bridge gateway or loopback.
+      # The daemon rejects 0.0.0.0 and public addresses with the Docker executor.
+      SHENNONG_RUNTIME_LISTEN: ${SHENNONG_RUNTIME_LISTEN:?set a private control-bridge address}
+      SHENNONG_RUNTIME_HEALTH_ADDR: ${SHENNONG_RUNTIME_LISTEN:?set a private control-bridge address}
+      SHENNONG_RUNTIME_DATABASE_URL: sqlite:///var/lib/shennong-runtime/runtime.db?mode=rwc
+      SHENNONG_EXECUTOR: docker
+      SHENNONG_ROOTLESS_DOCKER_SOCKET: /run/shennong-rootless/docker.sock
+      SHENNONG_JOB_EGRESS_NETWORK: shennong-job-egress
+      SHENNONG_SESSION_PROXY_NETWORK: shennong-session-proxy
+      SHENNONG_RUNTIME_INSTANCE_ID: ${SHENNONG_RUNTIME_INSTANCE_ID:?set a stable per-worker Runtime instance id}
+      # Runtime checks the root-owned attestation against the live RootlessKit
+      # child PID before health succeeds or any Job/Session is launched.
+      SHENNONG_ROOTLESS_UID: ${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}
+      SHENNONG_ROOTLESSKIT_CHILD_PID_FILE: /run/shennong-rootlesskit/child_pid
+      SHENNONG_EGRESS_POLICY_STATE_FILE: /run/shennong-egress/policy-${SHENNONG_RUNTIME_UID:?set the rootless Docker owner UID}.ready
+      SHENNONG_JOB_BRIDGE: ${SHENNONG_JOB_BRIDGE:-sn-job-egress}
+      SHENNONG_SESSION_BRIDGE: ${SHENNONG_SESSION_BRIDGE:-sn-session}
+      SHENNONG_RUNTIME_PROXY_V4: ${SHENNONG_RUNTIME_PROXY_V4:?set the exact Runtime proxy source IPv4 /32}
+      SHENNONG_JWT_ALGORITHM: EdDSA
+      SHENNONG_JWT_PUBLIC_KEY_FILE: /run/secrets/shennong_os_jwt_public_key
+      SHENNONG_JWT_ISSUER: shennong-os
+      SHENNONG_JWT_AUDIENCE: shennong-runtime
+      SHENNONG_JWT_MAX_TTL_SECONDS: 120
+      SHENNONG_OS_AUTH_COOKIE_NAMES: ${SHENNONG_OS_AUTH_COOKIE_NAMES:?set exact OS auth cookie names}
+      SHENNONG_MAX_CONCURRENT_JOBS: ${SHENNONG_MAX_CONCURRENT_JOBS:-4}
+      SHENNONG_MAX_CONCURRENT_SESSIONS: ${SHENNONG_MAX_CONCURRENT_SESSIONS:-2}
+      SHENNONG_MONITOR_INTERVAL_MS: ${SHENNONG_MONITOR_INTERVAL_MS:-2000}
+      SHENNONG_WORKER_PROFILES_JSON: |-
+        {
+          "profiles": [
+            {
+              "name": "cpu-small",
+              "image": "${SHENNONG_WORKER_IMAGE:?set a digest-pinned worker image}",
+              "kind": "batch",
+              "max_resources": {
+                "cpus": 2.0,
+                "memory_bytes": 8589934592,
+                "pids": 256,
+                "timeout_seconds": 1800,
+                "tmpfs_bytes": 1073741824,
+                "max_log_bytes": 8388608,
+                "max_artifact_bytes": 2147483648,
+                "max_workspace_bytes": 21474836480
+              }
+            },
+            {
+              "name": "ide-small",
+              "image": "${SHENNONG_IDE_IMAGE:?set a digest-pinned IDE image}",
+              "kind": "ide",
+              "max_resources": {
+                "cpus": 4.0,
+                "memory_bytes": 17179869184,
+                "pids": 512,
+                "timeout_seconds": 28800,
+                "tmpfs_bytes": 2147483648,
+                "max_log_bytes": 16777216,
+                "max_artifact_bytes": 4294967296,
+                "max_workspace_bytes": 53687091200
+              }
+            }
+          ]
+        }
+    volumes:
+      - type: bind
+        source: ${SHENNONG_ROOTLESS_DOCKER_SOCKET:?set the dedicated rootless Docker socket path}
+        target: /run/shennong-rootless/docker.sock
+        read_only: true
+      - type: bind
+        source: ${SHENNONG_ROOTLESSKIT_STATE_DIR:?set the dedicated RootlessKit state directory}
+        target: /run/shennong-rootlesskit
+        read_only: true
+      - type: bind
+        source: ${SHENNONG_EGRESS_POLICY_STATE_DIR:-/run/shennong-runtime-egress}
+        target: /run/shennong-egress
+        read_only: true
+      - type: volume
+        source: runtime-state
+        target: /var/lib/shennong-runtime
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+    secrets:
+      - shennong_os_jwt_public_key
+    # Host networking is limited to the trusted Runtime Daemon, never workloads.
+    # It is required so the daemon can proxy loopback-only IDE ports created by
+    # the separate rootless executor daemon. No Compose host port is published.
+    network_mode: host
+    healthcheck:
+      test: [CMD, /usr/local/bin/shennong-runtime, healthcheck]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  runtime-state:
+    name: shennong-runtime-state
+
+secrets:
+  shennong_os_jwt_public_key:
+    file: ${SHENNONG_OS_JWT_PUBLIC_KEY_FILE:?set the OS JWT public-key file}

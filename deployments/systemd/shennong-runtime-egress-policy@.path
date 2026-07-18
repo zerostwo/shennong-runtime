@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch Shennong Runtime RootlessKit namespace for UID %i
+
+[Path]
+PathChanged=/run/user/%i/shennong-runtime-rootlesskit/child_pid
+Unit=shennong-runtime-egress-policy@%i.service
+
+[Install]
+WantedBy=multi-user.target

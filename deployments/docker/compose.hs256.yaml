@@ -1,0 +1,15 @@
+# Compatibility override for an existing HS256-based Shennong OS deployment.
+# Prefer the Ed25519 public-key configuration in compose.rootless.yaml.
+# This override is outside the Shennong V1 production acceptance profile.
+services:
+  runtime:
+    environment:
+      SHENNONG_JWT_ALGORITHM: HS256
+      SHENNONG_JWT_HS256_SECRET_FILE: /run/secrets/shennong_runtime_jwt_hs256
+      SHENNONG_JWT_PUBLIC_KEY_FILE: ""
+    secrets:
+      - shennong_runtime_jwt_hs256
+
+secrets:
+  shennong_runtime_jwt_hs256:
+    file: ${SHENNONG_RUNTIME_JWT_HS256_SECRET_FILE:?set the host HS256 secret file}
