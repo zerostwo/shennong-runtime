@@ -41,7 +41,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pixi /usr/local/bin/pixi /usr/local/bin/pixi
-RUN pixi --version | grep -Eq '^pixi 0\\.54\\.2$'
+RUN pixi --version | grep -Eq '^pixi 0\.54\.2$'
 COPY --from=rust-build /out/shennong-runtime /usr/local/bin/shennong-runtime
 COPY --from=rust-build /out/shennong-ide-gateway /opt/shennong/bin/shennong-ide-gateway
 COPY container/worker/job_entrypoint.py /opt/shennong/bin/job_entrypoint.py
