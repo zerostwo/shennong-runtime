@@ -123,6 +123,28 @@ the Docker socket, while Job/Session/helper containers receive only their
 role-specific locked HostConfig. The older split Dockerfiles remain migration
 references and are no longer published.
 
+#### Toolchain contract and ownership
+
+The unified workload contract is R `4.2.x`, Python `3.11.x`, Pixi `0.54.2`,
+Node.js `24.16.0`, JupyterLab `4.6.1`, and RStudio Server `2026.07.0+139`.
+Pixi, Node.js, JupyterLab, and RStudio are exactly pinned in
+`container/runtime.Dockerfile`; the Pixi and Node stages are also digest-pinned,
+and the RStudio package is checksum-verified. The Docker build asserts the R,
+Python, and Pixi version contracts before publishing the image.
+
+R and Python come from Debian Bookworm. Their minor series are stable by
+contract, while their package revisions may change when security-fixed Debian
+packages are installed during a rebuild. Therefore a promoted
+`repository@sha256:...` digest, together with version output captured from that
+candidate image, is the exact runtime bill of materials. Documentation must not
+claim a patch version that the Dockerfile does not pin.
+
+The global image provides the language launchers, R's standard/recommended
+installation, and the isolated Jupyter environment. It does not promise an
+unversioned global scientific package set. Project dependencies belong in a
+declarative Pixi environment and lock, so analysis inputs can cite the image
+digest plus environment lock rather than depend on mutable global packages.
+
 ### Batch role and helpers
 
 The batch role uses R, Python, Pixi and a fixed Python entrypoint from the

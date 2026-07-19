@@ -59,6 +59,12 @@ implemented or released. Verify it in the current branch first.
   coverage.
 - `docs/architecture.md`: detailed design, ownership and cross-repo contracts.
 
+The unified image toolchain is part of the published contract. Keep the README,
+`docs/architecture.md`, Dockerfile version assertions, and changelog aligned
+when R, Python, Pixi, Node.js, JupyterLab, or RStudio changes. Do not document an
+R/Python patch version unless the package itself is pinned; use the image digest
+and captured version output for the exact deployed bill of materials.
+
 ## Architecture invariants
 
 Changes must preserve these invariants unless an approved design explicitly

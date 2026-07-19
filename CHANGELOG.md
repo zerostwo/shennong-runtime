@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Document the unified image's built-in R, Python, Pixi, Node.js, JupyterLab,
+  and RStudio versions, distinguish minor-series contracts from exact pins,
+  and enforce the documented R, Python, and Pixi versions during image builds.
 - Use the same unified Runtime image for daemon, worker, scanner, and IDE
   containers, including the hardened rootless Compose profile.
 - Default Docker Compose to the public unified Runtime image and built-in stable

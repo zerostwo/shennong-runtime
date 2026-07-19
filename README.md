@@ -275,6 +275,29 @@ and JupyterLab. Runtime selects the role by overriding the entrypoint and
 command for each workload. The older split Dockerfiles remain as migration
 references but are no longer published.
 
+### Built-in toolchain
+
+The unified image exposes the following tools to batch Jobs and IDE Sessions:
+
+| Tool | Image contract | Pinning and purpose |
+| --- | --- | --- |
+| R | `4.2.x` | Debian Bookworm `r-base`; the Docker build rejects another R minor series |
+| Python | `3.11.x` | Debian Bookworm `python3`; the Docker build rejects another Python minor series |
+| Pixi | `0.54.2` | Exact digest-pinned Pixi stage; manages reproducible Project environments |
+| Node.js | `24.16.0` | Exact digest-pinned final base image; available to workloads and support tooling |
+| JupyterLab | `4.6.1` | Exact Python package pin in `/opt/jupyter`; launched through the protected IDE gateway |
+| RStudio Server | `2026.07.0+139` | Exact downloaded `.deb` plus SHA-256 verification; launched through the protected IDE gateway |
+
+R and Python are intentionally expressed as minor-version contracts because
+their Debian package revisions can receive Bookworm security updates during an
+image rebuild. The immutable published image digest is the source of truth for
+the exact patch/build revision. Verify a candidate image with `R --version`,
+`python3 --version`, `pixi --version`, `node --version`, and
+`jupyter lab --version` before promoting its digest. The base image contains R's
+standard/recommended installation and the isolated Jupyter environment; Project
+analysis dependencies should be declared and locked through Pixi rather than
+assumed to be globally installed.
+
 Production profiles should use one `repository@sha256:...` reference. The image
 defaults to Posit's official RStudio Server `2026.07.0+139` Ubuntu 22 amd64
 package at
@@ -282,6 +305,7 @@ package at
 verified as SHA-256
 `e7b310c9e46811635b8dea8df82c729686c3a78f35cfa7767d9567e30f528465`.
 The checked-in Rust, Node, and Pixi defaults use reviewed manifest-list digests.
+Rust `1.97` is a build stage only and is not part of the workload toolchain.
 
 ## Session proxying
 

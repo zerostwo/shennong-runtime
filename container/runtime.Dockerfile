@@ -19,6 +19,8 @@ FROM ${NODE_IMAGE}
 ARG RSTUDIO_DEB_URL=https://download2.rstudio.org/server/jammy/amd64/rstudio-server-2026.07.0-139-amd64.deb
 ARG RSTUDIO_DEB_SHA256=e7b310c9e46811635b8dea8df82c729686c3a78f35cfa7767d9567e30f528465
 ARG JUPYTERLAB_VERSION=4.6.1
+ARG R_VERSION_SERIES=4.2
+ARG PYTHON_VERSION_SERIES=3.11
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -29,6 +31,8 @@ RUN apt-get update \
     && python3 -m venv /opt/jupyter \
     && /opt/jupyter/bin/pip install --no-cache-dir "jupyterlab==${JUPYTERLAB_VERSION}" \
     && ln -s /opt/jupyter/bin/jupyter /usr/local/bin/jupyter \
+    && python3 --version | grep -Eq "^Python ${PYTHON_VERSION_SERIES}\\." \
+    && R --version | grep -Eq "^R version ${R_VERSION_SERIES}\\." \
     && groupadd --gid 65532 shennong \
     && useradd --uid 65532 --gid 65532 --home-dir /workspace/.shennong/home --no-create-home --shell /usr/sbin/nologin shennong \
     && mkdir -p /opt/shennong/bin /opt/shennong/etc /workspace /data /run/shennong /var/lib/shennong-runtime \
@@ -37,6 +41,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pixi /usr/local/bin/pixi /usr/local/bin/pixi
+RUN pixi --version | grep -Eq '^pixi 0\\.54\\.2$'
 COPY --from=rust-build /out/shennong-runtime /usr/local/bin/shennong-runtime
 COPY --from=rust-build /out/shennong-ide-gateway /opt/shennong/bin/shennong-ide-gateway
 COPY container/worker/job_entrypoint.py /opt/shennong/bin/job_entrypoint.py
