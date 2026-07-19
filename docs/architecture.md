@@ -125,25 +125,31 @@ references and are no longer published.
 
 #### Toolchain contract and ownership
 
-The unified workload contract is R `4.2.x`, Python `3.11.x`, Pixi `0.54.2`,
+The unified workload contract is R `4.6.x`, Python `3.11.x`, Pixi `0.54.2`,
 Node.js `24.16.0`, JupyterLab `4.6.1`, and RStudio Server `2026.07.0+139`.
 Pixi, Node.js, JupyterLab, and RStudio are exactly pinned in
 `container/runtime.Dockerfile`; the Pixi and Node stages are also digest-pinned,
 and the RStudio package is checksum-verified. The Docker build asserts the R,
 Python, and Pixi version contracts before publishing the image.
 
-R and Python come from Debian Bookworm. Their minor series are stable by
-contract, while their package revisions may change when security-fixed Debian
-packages are installed during a rebuild. Therefore a promoted
+Python comes from Debian Bookworm and R comes from CRAN's signed Debian
+Bookworm repository. Their minor series are stable by contract, while package
+revisions may change when security-fixed packages are installed during a
+rebuild. Therefore a promoted
 `repository@sha256:...` digest, together with version output captured from that
 candidate image, is the exact runtime bill of materials. Documentation must not
 claim a patch version that the Dockerfile does not pin.
 
 The global image provides the language launchers, R's standard/recommended
-installation, and the isolated Jupyter environment. It does not promise an
-unversioned global scientific package set. Project dependencies belong in a
-declarative Pixi environment and lock, so analysis inputs can cite the image
-digest plus environment lock rather than depend on mutable global packages.
+installation, the isolated Jupyter environment, and commit-pinned
+Shennong/ShennongData packages. Their hard dependencies are installed globally;
+optional method backends remain Project dependencies in a declarative Pixi
+environment and lock. Each image build verifies the two packages, their
+read-only MCP tool lists, and their installed Skill assets, then writes the
+observed inventory to `/opt/shennong/runtime-r-toolchain.json`.
+The public `GET /v1/info` response exposes that validated document as
+`r_toolchain`, allowing the deployed image rather than its Dockerfile to prove
+which package, MCP, R, and Skill surface is live.
 
 ### Batch role and helpers
 

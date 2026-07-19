@@ -281,7 +281,9 @@ The unified image exposes the following tools to batch Jobs and IDE Sessions:
 
 | Tool | Image contract | Pinning and purpose |
 | --- | --- | --- |
-| R | `4.2.x` | Debian Bookworm `r-base`; the Docker build rejects another R minor series |
+| R | `4.6.x` | Signed CRAN Debian Bookworm repository; the Docker build rejects another R minor series |
+| Shennong | `0.2.0.9000` at commit `8a2a3a3` | Analysis package installed from a checksum-verified source archive |
+| ShennongData | `0.2.0` at commit `b560e1d` | ShennongDB R client installed from a checksum-verified source archive |
 | Python | `3.11.x` | Debian Bookworm `python3`; the Docker build rejects another Python minor series |
 | Pixi | `0.54.2` | Exact digest-pinned Pixi stage; manages reproducible Project environments |
 | Node.js | `24.16.0` | Exact digest-pinned final base image; available to workloads and support tooling |
@@ -289,14 +291,22 @@ The unified image exposes the following tools to batch Jobs and IDE Sessions:
 | RStudio Server | `2026.07.0+139` | Exact downloaded `.deb` plus SHA-256 verification; launched through the protected IDE gateway |
 
 R and Python are intentionally expressed as minor-version contracts because
-their Debian package revisions can receive Bookworm security updates during an
-image rebuild. The immutable published image digest is the source of truth for
-the exact patch/build revision. Verify a candidate image with `R --version`,
+their package revisions can receive security updates during an image rebuild.
+The immutable published image digest is the source of truth for the exact
+patch/build revision. Verify a candidate image with `R --version`,
 `python3 --version`, `pixi --version`, `node --version`, and
-`jupyter lab --version` before promoting its digest. The base image contains R's
-standard/recommended installation and the isolated Jupyter environment; Project
-analysis dependencies should be declared and locked through Pixi rather than
-assumed to be globally installed.
+`jupyter lab --version` before promoting its digest. The image preinstalls only
+the hard dependencies of Shennong and ShennongData. Optional analysis backends
+such as Seurat, SingleR, CellChat, and decoupleR remain Project dependencies and
+must be declared and locked through Pixi.
+
+Both packages' read-only MCP entry points are available through
+`Shennong::sn_mcp_server()` and `ShennongData::sn_mcp_serve()`. Their Agent
+Skills are installed under `/opt/shennong/agent/skills`, and the image build
+performs real JSON-RPC `initialize` and `tools/list` smoke tests. The resulting
+package, MCP-tool, R-version, and Skill inventory is recorded in
+`/opt/shennong/runtime-r-toolchain.json` for candidate-image verification and
+is exposed as `r_toolchain` by the live `GET /v1/info` endpoint.
 
 Production profiles should use one `repository@sha256:...` reference. The image
 defaults to Posit's official RStudio Server `2026.07.0+139` Ubuntu 22 amd64

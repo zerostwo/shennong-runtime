@@ -279,7 +279,7 @@ components:
     Info:
       type: object
       additionalProperties: false
-      required: [service, version, api_versions, executor, worker_profiles, network_policy]
+      required: [service, version, api_versions, executor, worker_profiles, network_policy, r_toolchain]
       properties:
         service: { type: string, const: shennong-runtime }
         version: { type: string }
@@ -291,6 +291,39 @@ components:
           type: array
           items: { type: string }
         network_policy: { type: string, const: internet_only }
+        r_toolchain:
+          description: Build-verified R package, read-only MCP, and Agent Skill inventory; null outside the unified image.
+          anyOf:
+            - $ref: "#/components/schemas/RToolchain"
+            - type: "null"
+    RToolchain:
+      type: object
+      additionalProperties: false
+      required: [schema, r, packages, mcp, skills]
+      properties:
+        schema: { type: string, const: shennong.dev/runtime-r-toolchain/v1 }
+        r: { type: string }
+        packages:
+          type: object
+          additionalProperties: false
+          required: [Shennong, ShennongData]
+          properties:
+            Shennong: { type: string }
+            ShennongData: { type: string }
+        mcp:
+          type: object
+          additionalProperties: false
+          required: [Shennong, ShennongData]
+          properties:
+            Shennong:
+              type: array
+              items: { type: string }
+            ShennongData:
+              type: array
+              items: { type: string }
+        skills:
+          type: array
+          items: { type: string }
     ResourceLimits:
       type: object
       additionalProperties: false

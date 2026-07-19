@@ -81,6 +81,37 @@ fn jupyterlab_461_uses_supported_proxy_and_log_arguments() {
 }
 
 #[test]
+fn unified_image_pins_and_smoke_tests_the_shennong_r_toolchain() {
+    let dockerfile = read("container/runtime.Dockerfile");
+    let installer = read("container/install-shennong-r-packages.R");
+    let verifier = read("container/verify-shennong-r-toolchain.R");
+
+    for required in [
+        "ARG R_VERSION_SERIES=4.6",
+        "bookworm-cran46/",
+        "ARG SHENNONG_REF=8a2a3a334098983674082fa323df3c6f8e927e5b",
+        "ARG SHENNONG_DATA_REF=b560e1d68429b74cf688c23e4b6b6700d68d9d2b",
+        "SHENNONG_TARBALL_SHA256",
+        "SHENNONG_DATA_TARBALL_SHA256",
+        "sha256sum --check --strict",
+        "install-shennong-r-packages.R",
+        "verify-shennong-r-toolchain.R",
+        "/opt/shennong/agent/skills/shennong-data",
+    ] {
+        assert!(
+            dockerfile.contains(required),
+            "missing unified Shennong toolchain contract: {required}"
+        );
+    }
+    assert!(installer.contains("dependencies = c(\"Depends\", \"Imports\", \"LinkingTo\")"));
+    assert!(!installer.contains("Suggests"));
+    assert!(verifier.contains("Shennong::sn_mcp_server"));
+    assert!(verifier.contains("ShennongData::sn_mcp_serve"));
+    assert!(verifier.contains("protocolVersion = \"2025-11-25\""));
+    assert!(verifier.contains("readOnlyHint"));
+}
+
+#[test]
 fn rstudio_non_root_state_and_database_paths_are_explicit() {
     let dockerfile = read("container/ide.Dockerfile");
     let worker_dockerfile = read("container/worker.Dockerfile");

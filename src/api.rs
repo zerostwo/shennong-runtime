@@ -73,6 +73,7 @@ async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         executor: state.executor.name(),
         worker_profiles: profiles,
         network_policy: "internet_only",
+        r_toolchain: runtime_r_toolchain_manifest(),
     })
 }
 
@@ -199,6 +200,50 @@ struct InfoResponse {
     executor: &'static str,
     worker_profiles: Vec<String>,
     network_policy: &'static str,
+    r_toolchain: Option<serde_json::Value>,
+}
+
+fn runtime_r_toolchain_manifest() -> Option<serde_json::Value> {
+    let path = std::env::var("SHENNONG_R_TOOLCHAIN_MANIFEST")
+        .unwrap_or_else(|_| "/opt/shennong/runtime-r-toolchain.json".into());
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    parse_runtime_r_toolchain_manifest(&bytes)
+}
+
+fn parse_runtime_r_toolchain_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        != Some("shennong.dev/runtime-r-toolchain/v1")
+        || !value
+            .pointer("/packages/Shennong")
+            .is_some_and(serde_json::Value::is_string)
+        || !value
+            .pointer("/packages/ShennongData")
+            .is_some_and(serde_json::Value::is_string)
+    {
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_runtime_r_toolchain_manifest;
+
+    #[test]
+    fn r_toolchain_info_accepts_only_the_verified_manifest_shape() {
+        let valid = br#"{
+          "schema":"shennong.dev/runtime-r-toolchain/v1",
+          "packages":{"Shennong":"0.2.0.9000","ShennongData":"0.2.0"},
+          "mcp":{},"skills":[]
+        }"#;
+        assert!(parse_runtime_r_toolchain_manifest(valid).is_some());
+        assert!(parse_runtime_r_toolchain_manifest(br#"{"schema":"other"}"#).is_none());
+        assert!(parse_runtime_r_toolchain_manifest(b"not-json").is_none());
+    }
 }
 
 #[derive(Deserialize)]

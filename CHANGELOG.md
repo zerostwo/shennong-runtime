@@ -13,12 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jobs, RStudio, and JupyterLab sessions.
 - Add an explicit `simple` Docker mode for the three-container single-host
   deployment while retaining hardened rootless mode as the default.
+- Preinstall commit-pinned Shennong and ShennongData R packages, their Agent
+  Skills, and their read-only MCP servers in the unified Runtime image, with
+  build-time JSON-RPC smoke tests and a machine-readable toolchain inventory
+  exposed through `GET /v1/info`.
 
 ### Changed
 
 - Document the unified image's built-in R, Python, Pixi, Node.js, JupyterLab,
   and RStudio versions, distinguish minor-series contracts from exact pins,
   and enforce the documented R, Python, and Pixi versions during image builds.
+- Upgrade the unified image's R contract from Debian `4.2.x` to the signed CRAN
+  Debian `4.6.x` series required by ShennongData.
 - Use the same unified Runtime image for daemon, worker, scanner, and IDE
   containers, including the hardened rootless Compose profile.
 - Default Docker Compose to the public unified Runtime image and built-in stable
