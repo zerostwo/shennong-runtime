@@ -23,8 +23,21 @@ Production invariants:
   SHA-256 digest of the 256-bit bearer secret enters the IDE container;
 - supervised `max_workspace_bytes` enforcement plus a hard filesystem quota on
   the dedicated rootless Docker data root for burst/outage containment;
-- OS-only Project input resolution with verified SHA-256, strict relative paths,
-  a 1 MiB aggregate limit, and an unguessable per-Job staging directory;
+- OS-only Project input resolution with verified decoded-byte SHA-256, strict
+  relative paths, explicit UTF-8/base64 encoding, 1 MiB per-file and aggregate
+  limits, and an unguessable per-Job staging directory;
+- Docker-mode health/admission bound to the canonical toolchain manifest and
+  its actual Shennong/ShennongData source commits; explicit lock mismatches fail
+  closed and missing legacy locks remain visibly unbound;
+- Job success gated by required Artifact roles and credential-free Result
+  Bundle v1 validation with immutable input references and scanner-manifest
+  output comparison; the scanner hashes an already-opened regular-file
+  descriptor reached through no-follow directory-relative opens;
+- Artifact content reads authorized by the owning Job JWT and implemented by a
+  networkless read-only helper using no-follow directory-relative opens,
+  regular-file/size/SHA-256 checks, bounded tmpfs and a 64 MiB response limit;
+- no ShennongDB credential in Runtime or its workloads; candidate byte reads
+  are not authorization, upload, or durable Artifact promotion;
 - verified unified backup of OS PostgreSQL, headless DB data, Runtime SQLite,
   deployment metadata/secrets, and explicitly allowlisted workspaces; Runtime
   SQLite remains a recovery journal rather than a product database.

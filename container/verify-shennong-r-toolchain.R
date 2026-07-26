@@ -42,8 +42,18 @@ smoke_server <- function(server, expected_tools) {
 stopifnot(
   getRversion() >= "4.6.0",
   identical(as.character(utils::packageVersion("Shennong")), "0.2.0.9000"),
-  identical(as.character(utils::packageVersion("ShennongData")), "0.2.0")
+  identical(as.character(utils::packageVersion("ShennongData")), "0.2.0.9000")
 )
+
+source_commits <- list(
+  Shennong = Sys.getenv("SHENNONG_REF"),
+  ShennongData = Sys.getenv("SHENNONG_DATA_REF")
+)
+stopifnot(all(vapply(
+  source_commits,
+  function(value) grepl("^[0-9a-f]{40}$", value),
+  logical(1)
+)))
 
 config <- Shennong::sn_mcp_server_config()
 stopifnot(
@@ -81,6 +91,7 @@ manifest <- list(
     Shennong = as.character(utils::packageVersion("Shennong")),
     ShennongData = as.character(utils::packageVersion("ShennongData"))
   ),
+  source_commits = source_commits,
   mcp = list(
     Shennong = c("list_methods", "method_status", "function_help", "workflow_guide", "package_info"),
     ShennongData = c(

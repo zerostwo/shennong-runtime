@@ -146,6 +146,46 @@ paths:
                     items: { $ref: "#/components/schemas/Artifact" }
         "404":
           $ref: "#/components/responses/Error"
+  /v1/jobs/{id}/artifacts/{artifact_id}/content:
+    get:
+      tags: [jobs]
+      operationId: getJobArtifactContent
+      description: >-
+        Returns one bounded artifact from this Job's workspace volume only.
+        Runtime reopens it through a networkless read-only helper, forbids
+        symlinks, and revalidates path, size, and SHA-256 against the persisted
+        manifest before returning bytes. This is not durable DB promotion.
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: "#/components/parameters/ResourceId"
+        - name: artifact_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Revalidated artifact bytes, capped at 64 MiB per request
+          headers:
+            X-Content-Sha256:
+              schema:
+                type: string
+                pattern: "^[a-f0-9]{64}$"
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                maxLength: 67108864
+        "401":
+          $ref: "#/components/responses/Error"
+        "403":
+          $ref: "#/components/responses/Error"
+        "404":
+          $ref: "#/components/responses/Error"
+        "409":
+          $ref: "#/components/responses/Error"
+        "422":
+          $ref: "#/components/responses/Error"
   /v1/sessions:
     post:
       tags: [sessions]
@@ -271,15 +311,27 @@ components:
     Health:
       type: object
       additionalProperties: false
-      required: [status, journal, executor]
+      required: [status, journal, executor, r_toolchain_status, r_toolchain_sha256, package_commits]
       properties:
         status: { type: string, const: ok }
         journal: { type: string, const: ok }
         executor: { type: string }
+        r_toolchain_status:
+          type: string
+          enum: [verified, unavailable]
+          description: Unified Docker execution requires verified; mock development may be unavailable.
+        r_toolchain_sha256:
+          type: [string, "null"]
+          pattern: "^[a-f0-9]{64}$"
+          description: SHA-256 of the canonical JSON encoding returned as r_toolchain by /v1/info.
+        package_commits:
+          anyOf:
+            - $ref: "#/components/schemas/SourceCommits"
+            - type: "null"
     Info:
       type: object
       additionalProperties: false
-      required: [service, version, api_versions, executor, worker_profiles, network_policy, r_toolchain]
+      required: [service, version, api_versions, executor, worker_profiles, network_policy, r_toolchain, r_toolchain_sha256, package_commits]
       properties:
         service: { type: string, const: shennong-runtime }
         version: { type: string }
@@ -296,10 +348,18 @@ components:
           anyOf:
             - $ref: "#/components/schemas/RToolchain"
             - type: "null"
+        r_toolchain_sha256:
+          type: [string, "null"]
+          pattern: "^[a-f0-9]{64}$"
+          description: SHA-256 of the canonical r_toolchain JSON document.
+        package_commits:
+          anyOf:
+            - $ref: "#/components/schemas/SourceCommits"
+            - type: "null"
     RToolchain:
       type: object
       additionalProperties: false
-      required: [schema, r, packages, mcp, skills]
+      required: [schema, r, packages, source_commits, mcp, skills]
       properties:
         schema: { type: string, const: shennong.dev/runtime-r-toolchain/v1 }
         r: { type: string }
@@ -310,6 +370,7 @@ components:
           properties:
             Shennong: { type: string }
             ShennongData: { type: string }
+        source_commits: { $ref: "#/components/schemas/SourceCommits" }
         mcp:
           type: object
           additionalProperties: false
@@ -324,6 +385,13 @@ components:
         skills:
           type: array
           items: { type: string }
+    SourceCommits:
+      type: object
+      additionalProperties: false
+      required: [Shennong, ShennongData]
+      properties:
+        Shennong: { type: string, pattern: "^[a-f0-9]{40}$" }
+        ShennongData: { type: string, pattern: "^[a-f0-9]{40}$" }
     ResourceLimits:
       type: object
       additionalProperties: false
@@ -353,6 +421,16 @@ components:
           maxLength: 512
           description: Glob relative to /workspace; absolute and parent paths are rejected.
         kind: { $ref: "#/components/schemas/ArtifactKind" }
+        role:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 64
+          pattern: "^[A-Za-z0-9_.-]+$"
+          description: Stable semantic role propagated into the scanned manifest.
+        required:
+          type: boolean
+          default: false
+          description: A successful Job must produce a matching artifact when true.
     ArtifactKind:
       type: string
       enum: [figure, image, table, report, notebook, script, dataset_subset, archive, other]
@@ -366,12 +444,129 @@ components:
           minLength: 1
           maxLength: 512
           description: Project-relative UTF-8 input path staged below a per-Job private workspace directory.
+        encoding:
+          type: string
+          enum: [utf8, base64]
+          default: utf8
+          description: Base64 is decoded before byte-limit and SHA-256 validation.
         content:
           type: string
-          maxLength: 1048576
+          maxLength: 1398104
         sha256:
           type: string
           pattern: "^[a-f0-9]{64}$"
+          description: Digest of decoded bytes, not of the base64 text.
+    CompatibilityPackage:
+      type: object
+      additionalProperties: false
+      required: [version, commit]
+      properties:
+        version: { type: string, minLength: 1, maxLength: 128 }
+        commit: { type: string, pattern: "^[a-f0-9]{40}$" }
+    CompatibilityLock:
+      type: object
+      additionalProperties: false
+      required: [result_bundle_schema, runtime_toolchain, packages]
+      properties:
+        result_bundle_schema:
+          type: string
+          const: shennong.dev/analysis-result-bundle/v1
+        runtime_toolchain:
+          type: object
+          additionalProperties: false
+          required: [schema, sha256]
+          properties:
+            schema:
+              type: string
+              const: shennong.dev/runtime-r-toolchain/v1
+            sha256: { type: string, pattern: "^[a-f0-9]{64}$" }
+        packages:
+          type: object
+          additionalProperties: false
+          required: [Shennong, ShennongData]
+          properties:
+            Shennong: { $ref: "#/components/schemas/CompatibilityPackage" }
+            ShennongData: { $ref: "#/components/schemas/CompatibilityPackage" }
+    Sha256Digest:
+      type: object
+      additionalProperties: false
+      required: [algorithm, value]
+      properties:
+        algorithm: { type: string, const: sha256 }
+        value: { type: string, pattern: "^[a-f0-9]{64}$" }
+    ResultBundleInput:
+      type: object
+      additionalProperties: false
+      required: [role, revision, digest]
+      properties:
+        role: { type: string, minLength: 1 }
+        revision: { type: string, minLength: 1 }
+        digest: { $ref: "#/components/schemas/Sha256Digest" }
+        resource_id: { type: string, minLength: 1 }
+        artifact_id: { type: string, minLength: 1 }
+        media_type: { type: string, minLength: 1 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        metadata: { type: object }
+      anyOf:
+        - required: [resource_id]
+        - required: [artifact_id]
+    ResultBundleArtifact:
+      type: object
+      additionalProperties: false
+      required: [role, digest]
+      properties:
+        role: { type: string, minLength: 1 }
+        digest: { $ref: "#/components/schemas/Sha256Digest" }
+        artifact_id: { type: string, minLength: 1 }
+        path:
+          type: string
+          minLength: 1
+          description: Safe bundle-relative path; Runtime requires path or a matching manifest artifact_id.
+        media_type: { type: string, minLength: 1 }
+        size_bytes: { type: integer, format: int64, minimum: 0 }
+        metadata: { type: object }
+    AnalysisResultBundleV1:
+      type: object
+      required: [schema, created_at, result, validation, inputs, provenance, artifacts]
+      description: >-
+        Credential-free candidate result contract owned by Shennong. Before
+        success Runtime requires immutable inputs, recursively rejects the
+        frozen credential-field names, and compares every output record with
+        the scanner manifest. Validation does not upload or promote bytes.
+      properties:
+        schema:
+          type: string
+          const: shennong.dev/analysis-result-bundle/v1
+        created_at: { type: string, format: date-time }
+        result: { type: object }
+        validation:
+          type: object
+          required: [valid, errors, warnings]
+          properties:
+            valid: { type: boolean, const: true }
+            errors:
+              type: array
+              items: { type: string }
+            warnings:
+              type: array
+              items: { type: string }
+        inputs:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items: { $ref: "#/components/schemas/ResultBundleInput" }
+        provenance:
+          type: object
+          required: [package_versions, random_seed, result_timestamp, execution]
+          properties:
+            package_versions: { type: object }
+            random_seed: {}
+            result_timestamp: { type: string, minLength: 1 }
+            execution: { type: object }
+        artifacts:
+          type: array
+          maxItems: 256
+          items: { $ref: "#/components/schemas/ResultBundleArtifact" }
     JobSpec:
       type: object
       additionalProperties: false
@@ -398,16 +593,24 @@ components:
         workspace_files:
           type: array
           maxItems: 32
-          description: OS-resolved governed Project files; total UTF-8 payload is capped at 1 MiB and digests are verified.
+          description: OS-resolved governed Project files; decoded payload is capped at 1 MiB per file and 1 MiB total, and digests are verified.
           items: { $ref: "#/components/schemas/WorkspaceFile" }
         artifact_rules:
           type: array
           maxItems: 64
           items: { $ref: "#/components/schemas/ArtifactRule" }
+        compatibility_lock:
+          description: >-
+            Optional fail-closed binding to the exact live toolchain and Result
+            Bundle v1. When omitted, Job.compatibility_status is unbound. When
+            present, exactly one required analysis_result_bundle rule is required.
+          anyOf:
+            - $ref: "#/components/schemas/CompatibilityLock"
+            - type: "null"
     Job:
       type: object
       additionalProperties: false
-      required: [id, state, workspace_ref, worker_profile, attempt, log_truncated, created_at, updated_at]
+      required: [id, state, workspace_ref, worker_profile, attempt, log_truncated, compatibility_status, created_at, updated_at]
       properties:
         id: { type: string, format: uuid }
         state:
@@ -419,6 +622,10 @@ components:
         exit_code: { type: [integer, "null"], format: int64 }
         error: { type: [string, "null"] }
         log_truncated: { type: boolean }
+        compatibility_status:
+          type: string
+          enum: [unbound, verified]
+          description: Missing legacy lock is unbound; verified is emitted only after exact admission matching.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     LogEntry:
@@ -443,7 +650,7 @@ components:
     Artifact:
       type: object
       additionalProperties: false
-      required: [id, relative_path, kind, size_bytes, sha256, media_type]
+      required: [id, relative_path, kind, size_bytes, sha256, media_type, role]
       properties:
         id: { type: string, format: uuid }
         relative_path: { type: string }
@@ -451,6 +658,10 @@ components:
         size_bytes: { type: integer, format: int64, minimum: 0 }
         sha256: { type: string, pattern: "^[a-fA-F0-9]{64}$" }
         media_type: { type: [string, "null"] }
+        role:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 64
     SessionSpec:
       type: object
       additionalProperties: false

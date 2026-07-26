@@ -12,6 +12,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use shennong_runtime::{AppState, RuntimeConfig, auth::RuntimeClaims, router};
 use tempfile::TempDir;
 use tokio::time::{Duration, interval, sleep, timeout};
@@ -35,6 +36,30 @@ impl TestApp {
         let database = directory.path().join("runtime.db");
         let mut config =
             RuntimeConfig::for_test(format!("sqlite://{}?mode=rwc", database.display()));
+        let toolchain = directory.path().join("runtime-r-toolchain.json");
+        std::fs::write(
+            &toolchain,
+            serde_json::to_vec_pretty(&json!({
+                "schema": "shennong.dev/runtime-r-toolchain/v1",
+                "r": "R version 4.6.0",
+                "packages": {
+                    "Shennong": "0.2.0.9000",
+                    "ShennongData": "0.2.0.9000"
+                },
+                "source_commits": {
+                    "Shennong": "c1d958db3319f635ff5d6f9ad484a208774a4a39",
+                    "ShennongData": "17f0f0e87dd8ad2a3751dd11c58c8aa43823aa69"
+                },
+                "mcp": {
+                    "Shennong": ["list_methods"],
+                    "ShennongData": ["check_compatibility"]
+                },
+                "skills": ["manage-shennong-results"]
+            }))
+            .expect("serialize toolchain"),
+        )
+        .expect("write toolchain");
+        config.r_toolchain_manifest_path = toolchain;
         config.max_concurrent_jobs = max_jobs;
         config.max_concurrent_sessions = max_sessions;
         let state = Arc::new(AppState::build(config).await.expect("build app state"));
@@ -130,6 +155,30 @@ impl TestApp {
                 .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes).to_string()}))
         };
         (status, value)
+    }
+
+    async fn request_bytes(
+        &self,
+        uri: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let mut builder = Request::builder().method("GET").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        let response = self
+            .app
+            .clone()
+            .oneshot(builder.body(Body::empty()).expect("build request"))
+            .await
+            .expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
+            .await
+            .expect("read response")
+            .to_vec();
+        (status, headers, bytes)
     }
 }
 
@@ -247,6 +296,26 @@ fn session_spec() -> Value {
     })
 }
 
+fn compatibility_lock(info: &Value) -> Value {
+    json!({
+        "result_bundle_schema": "shennong.dev/analysis-result-bundle/v1",
+        "runtime_toolchain": {
+            "schema": "shennong.dev/runtime-r-toolchain/v1",
+            "sha256": info["r_toolchain_sha256"]
+        },
+        "packages": {
+            "Shennong": {
+                "version": info["r_toolchain"]["packages"]["Shennong"],
+                "commit": info["package_commits"]["Shennong"]
+            },
+            "ShennongData": {
+                "version": info["r_toolchain"]["packages"]["ShennongData"],
+                "commit": info["package_commits"]["ShennongData"]
+            }
+        }
+    })
+}
+
 #[tokio::test]
 async fn health_is_public_but_jobs_require_a_valid_audience() {
     let test = TestApp::new().await;
@@ -350,6 +419,252 @@ async fn submit_is_idempotent_and_exposes_bounded_logs_and_artifacts() {
         artifacts["artifacts"][0]["relative_path"],
         "results/mock-result.txt"
     );
+
+    let artifact_id = artifacts["artifacts"][0]["id"]
+        .as_str()
+        .expect("artifact id");
+    let content_uri = format!("/v1/jobs/{id}/artifacts/{artifact_id}/content");
+    let (status, _, _) = test.request_bytes(&content_uri, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, headers, bytes) = test.request_bytes(&content_uri, Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(bytes, b"mock artifact\n");
+    assert_eq!(
+        headers
+            .get("x-content-sha256")
+            .expect("content digest")
+            .to_str()
+            .unwrap(),
+        hex::encode(Sha256::digest(&bytes))
+    );
+}
+
+#[tokio::test]
+async fn artifact_content_is_reverified_against_the_persisted_manifest() {
+    let test = TestApp::new().await;
+    let token = test.token_with(
+        "shennong-runtime",
+        vec!["runtime:jobs:write", "runtime:jobs:read"],
+        vec!["ws_artifact_tamper"],
+    );
+    let mut spec = job_spec();
+    spec["workspace_ref"] = json!("ws_artifact_tamper");
+    let (status, submitted) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(spec),
+            Some(&token),
+            Some("idem-artifact-tamper"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+    let id = submitted["id"].as_str().expect("job id");
+    sleep(Duration::from_millis(250)).await;
+    let (_, artifacts) = test
+        .request(
+            "GET",
+            &format!("/v1/jobs/{id}/artifacts"),
+            None,
+            Some(&token),
+            None,
+        )
+        .await;
+    let artifact_id = artifacts["artifacts"][0]["id"]
+        .as_str()
+        .expect("artifact id");
+    let (status, _, bytes) = test
+        .request_bytes(
+            &format!("/v1/jobs/{id}/artifacts/{artifact_id}/content"),
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(String::from_utf8_lossy(&bytes).contains("manifest"));
+}
+
+#[tokio::test]
+async fn legacy_jobs_are_explicitly_unbound_and_toolchain_identity_is_visible() {
+    let test = TestApp::new().await;
+    let token = test.token("shennong-runtime");
+    let (status, health) = test.request("GET", "/v1/health", None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    assert_eq!(health["r_toolchain_status"], "verified");
+    assert!(
+        health["r_toolchain_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert!(
+        health["package_commits"]["Shennong"]
+            .as_str()
+            .is_some_and(|value| value.len() == 40)
+    );
+
+    let (status, submitted) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(job_spec()),
+            Some(&token),
+            Some("idem-unbound-job"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+    assert_eq!(submitted["compatibility_status"], "unbound");
+}
+
+#[tokio::test]
+async fn locked_jobs_match_the_live_toolchain_and_require_a_valid_result_bundle() {
+    let test = TestApp::new().await;
+    let token = test.token("shennong-runtime");
+    let (status, info) = test.request("GET", "/v1/info", None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    let lock = compatibility_lock(&info);
+    let mut spec = job_spec();
+    spec["compatibility_lock"] = lock.clone();
+    spec["artifact_rules"] = json!([
+        {
+            "path": "results/mock-result.txt",
+            "kind": "table",
+            "role": "primary_table",
+            "required": true
+        },
+        {
+            "path": "results/mock-result-bundle.json",
+            "kind": "report",
+            "role": "analysis_result_bundle",
+            "required": true
+        }
+    ]);
+    let (status, submitted) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(spec),
+            Some(&token),
+            Some("idem-locked-job"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+    assert_eq!(submitted["compatibility_status"], "verified");
+    let id = submitted["id"].as_str().expect("job id");
+    sleep(Duration::from_millis(250)).await;
+    let (status, completed) = test
+        .request("GET", &format!("/v1/jobs/{id}"), None, Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+
+    let mut mismatch = job_spec();
+    let mut bad_lock = lock;
+    bad_lock["runtime_toolchain"]["sha256"] = json!("f".repeat(64));
+    mismatch["compatibility_lock"] = bad_lock;
+    mismatch["artifact_rules"] = json!([{
+        "path": "results/mock-result-bundle.json",
+        "kind": "report",
+        "role": "analysis_result_bundle",
+        "required": true
+    }]);
+    let (status, rejected) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(mismatch),
+            Some(&token),
+            Some("idem-mismatched-lock"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .expect("lock error")
+            .contains("toolchain manifest sha256")
+    );
+}
+
+#[tokio::test]
+async fn result_bundle_credentials_fail_the_job_before_success() {
+    let test = TestApp::new().await;
+    let token = test.token("shennong-runtime");
+    let (_, info) = test.request("GET", "/v1/info", None, None, None).await;
+    let mut spec = job_spec();
+    spec["compatibility_lock"] = compatibility_lock(&info);
+    spec["argv"] = json!(["python3", "analysis.py", "mock-sensitive-bundle"]);
+    spec["artifact_rules"] = json!([
+        {
+            "path": "results/mock-result.txt",
+            "kind": "table",
+            "role": "primary_table",
+            "required": true
+        },
+        {
+            "path": "results/mock-result-bundle.json",
+            "kind": "report",
+            "role": "analysis_result_bundle",
+            "required": true
+        }
+    ]);
+    let (status, submitted) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(spec),
+            Some(&token),
+            Some("idem-sensitive-bundle"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+    let id = submitted["id"].as_str().expect("job id");
+    sleep(Duration::from_millis(250)).await;
+    let (status, completed) = test
+        .request("GET", &format!("/v1/jobs/{id}"), None, Some(&token), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{completed}");
+    assert_eq!(completed["state"], "failed", "{completed}");
+    assert!(
+        completed["error"]
+            .as_str()
+            .expect("bundle validation error")
+            .contains("credential")
+    );
+}
+
+#[tokio::test]
+async fn base64_workspace_inputs_are_digest_checked_over_decoded_bytes() {
+    let test = TestApp::new().await;
+    let token = test.token("shennong-runtime");
+    let payload = [0_u8, 255, 1, 128];
+    let mut spec = job_spec();
+    spec["workspace_files"] = json!([{
+        "path": "inputs/binary.bin",
+        "encoding": "base64",
+        "content": "AP8BgA==",
+        "sha256": hex::encode(Sha256::digest(payload))
+    }]);
+    let (status, submitted) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(spec.clone()),
+            Some(&token),
+            Some("idem-binary-input"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+
+    spec["workspace_files"][0]["sha256"] = json!("0".repeat(64));
+    let (status, rejected) = test
+        .request(
+            "POST",
+            "/v1/jobs",
+            Some(spec),
+            Some(&token),
+            Some("idem-binary-input-bad-digest"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
 }
 
 #[tokio::test]

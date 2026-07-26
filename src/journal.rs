@@ -10,8 +10,8 @@ use uuid::Uuid;
 use crate::{
     error::{Result, RuntimeError},
     model::{
-        ArtifactManifestEntry, IdeKind, JobRecord, JobSpec, JobState, JobView, LogEntry, LogStream,
-        SessionRecord, SessionSpec, SessionState, SessionView,
+        ArtifactManifestEntry, CompatibilityStatus, IdeKind, JobRecord, JobSpec, JobState, JobView,
+        LogEntry, LogStream, SessionRecord, SessionSpec, SessionState, SessionView,
     },
 };
 
@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
     size_bytes INTEGER NOT NULL,
     sha256 TEXT NOT NULL,
     media_type TEXT,
+    role TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(job_id, relative_path)
 );
@@ -87,7 +88,7 @@ CREATE INDEX IF NOT EXISTS sessions_state_idx ON sessions(state);
 CREATE INDEX IF NOT EXISTS sessions_owner_idx ON sessions(owner_sub, created_at);
 "#;
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub struct Journal {
@@ -129,6 +130,7 @@ struct ArtifactRow {
     size_bytes: i64,
     sha256: String,
     media_type: Option<String>,
+    role: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -362,8 +364,8 @@ impl Journal {
         for artifact in artifacts {
             sqlx::query(
                 r#"INSERT INTO artifacts
-                   (id, job_id, relative_path, kind, size_bytes, sha256, media_type, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                   (id, job_id, relative_path, kind, size_bytes, sha256, media_type, role, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(artifact.id.to_string())
             .bind(job_id.to_string())
@@ -372,6 +374,7 @@ impl Journal {
             .bind(artifact.size_bytes)
             .bind(&artifact.sha256)
             .bind(&artifact.media_type)
+            .bind(&artifact.role)
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -382,7 +385,7 @@ impl Journal {
 
     pub async fn artifacts(&self, job_id: Uuid) -> Result<Vec<ArtifactManifestEntry>> {
         let rows = sqlx::query_as::<_, ArtifactRow>(
-            "SELECT id, relative_path, kind, size_bytes, sha256, media_type FROM artifacts WHERE job_id = ? ORDER BY relative_path",
+            "SELECT id, relative_path, kind, size_bytes, sha256, media_type, role FROM artifacts WHERE job_id = ? ORDER BY relative_path",
         )
         .bind(job_id.to_string())
         .fetch_all(&self.pool)
@@ -397,6 +400,7 @@ impl Journal {
                     size_bytes: row.size_bytes,
                     sha256: row.sha256,
                     media_type: row.media_type,
+                    role: row.role,
                 })
             })
             .collect()
@@ -699,6 +703,12 @@ async fn initialize_schema(pool: &SqlitePool) -> Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    if version < 3 {
+        migrate_artifact_roles(&mut transaction).await?;
+        sqlx::query("PRAGMA user_version = 3")
+            .execute(&mut *transaction)
+            .await?;
+    }
 
     validate_current_schema(&mut transaction).await?;
     transaction.commit().await?;
@@ -749,11 +759,21 @@ async fn migrate_session_security_and_activity(
     Ok(())
 }
 
+async fn migrate_artifact_roles(transaction: &mut Transaction<'_, Sqlite>) -> Result<()> {
+    if !has_column(transaction, "artifacts", "role").await? {
+        sqlx::query("ALTER TABLE artifacts ADD COLUMN role TEXT")
+            .execute(&mut **transaction)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn validate_current_schema(transaction: &mut Transaction<'_, Sqlite>) -> Result<()> {
     for (table, column) in [
         ("jobs", "log_bytes"),
         ("sessions", "last_activity_at"),
         ("sessions", "internal_secret"),
+        ("artifacts", "role"),
     ] {
         if !has_column(transaction, table, column).await? {
             return Err(RuntimeError::Internal(format!(
@@ -772,6 +792,7 @@ async fn has_column(
     let statement = match table {
         "jobs" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name = ?)",
         "sessions" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?)",
+        "artifacts" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name = ?)",
         _ => {
             return Err(RuntimeError::Internal(format!(
                 "unsupported migration table {table}"
@@ -798,6 +819,8 @@ fn parse_executor_rows(rows: Vec<(String, String)>) -> Result<Vec<(Uuid, String)
 
 fn job_from_row(row: JobRow) -> Result<JobRecord> {
     let id = Uuid::parse_str(&row.id).map_err(|error| RuntimeError::Internal(error.to_string()))?;
+    let spec: JobSpec = serde_json::from_str(&row.spec_json)
+        .map_err(|error| RuntimeError::Internal(error.to_string()))?;
     Ok(JobRecord {
         view: JobView {
             id,
@@ -808,14 +831,18 @@ fn job_from_row(row: JobRow) -> Result<JobRecord> {
             exit_code: row.exit_code,
             error: row.error,
             log_truncated: row.log_truncated,
+            compatibility_status: if spec.compatibility_lock.is_some() {
+                CompatibilityStatus::Verified
+            } else {
+                CompatibilityStatus::Unbound
+            },
             created_at: row.created_at,
             updated_at: row.updated_at,
         },
         owner_sub: row.owner_sub,
         idempotency_key: row.idempotency_key,
         request_hash: row.request_hash,
-        spec: serde_json::from_str(&row.spec_json)
-            .map_err(|error| RuntimeError::Internal(error.to_string()))?,
+        spec,
         executor_id: row.executor_id,
     })
 }

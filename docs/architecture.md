@@ -150,6 +150,11 @@ observed inventory to `/opt/shennong/runtime-r-toolchain.json`.
 The public `GET /v1/info` response exposes that validated document as
 `r_toolchain`, allowing the deployed image rather than its Dockerfile to prove
 which package, MCP, R, and Skill surface is live.
+The build also records the two checksum-verified source commit pins.
+Runtime hashes a canonical JSON encoding, exposes the manifest SHA-256 and
+source commits in `/v1/info` and `/v1/health`, requires the manifest for Docker
+execution, and uses it for fail-closed Job admission when a compatibility lock
+is present.
 
 ### Batch role and helpers
 
@@ -158,16 +163,36 @@ unified image. Runtime passes a direct executable argv; the entrypoint calls
 `execvp` and never starts a shell. Runtime, not the caller, selects the
 digest-pinned image, UID/GID, network, volume, resource limits and HostConfig.
 
-OS-resolved project inputs are bounded UTF-8 `workspace_files` in `JobSpec`.
-Runtime verifies their SHA-256 digests and stages them below an unguessable
-per-Job directory through a stopped networkless helper. A caller can reference
-only those files with `workspace-input://...`; it cannot submit a host path or
-Docker volume name.
+OS-resolved project inputs are bounded `workspace_files` in `JobSpec`. They are
+either direct UTF-8 or explicitly base64-encoded binary content; Runtime hashes
+the decoded bytes, enforces 32 files, 1 MiB per file and 1 MiB decoded total,
+and stages them below an unguessable per-Job directory through a stopped
+networkless helper. A caller can reference only those files with
+`workspace-input://...`; it cannot submit a host path or Docker volume name.
 
 After a successful worker exit, a separate helper scans the workspace with
-`network=none` and a read-only mount. It rejects symlinks and escaping paths,
-bounds path traversal, file count and aggregate bytes, hashes each artifact,
-and returns a manifest. Runtime does not expose an artifact-bytes endpoint.
+`network=none` and a read-only mount. It opens each matched path component
+relative to an already-open workspace descriptor with `O_NOFOLLOW`, rejects
+symlinks, escaping paths and non-regular files, bounds path traversal, file
+count and aggregate bytes, hashes the opened descriptor, and returns a
+role-bearing manifest. Required rules must match before success.
+The authenticated content endpoint can return one artifact only after Job
+success. A separate networkless helper opens every path component relative to
+the Job volume with `O_NOFOLLOW`, copies only a regular file into bounded
+tmpfs, and rechecks size and SHA-256. The daemon revalidates the downloaded
+bytes again and caps a response at 64 MiB. These operational bytes are not a
+durable OS/DB Artifact.
+
+An optional `compatibility_lock` binds a Job to the fixed Result Bundle schema,
+the canonical runtime-toolchain manifest digest, and exact
+Shennong/ShennongData versions and source commits. A missing lock is preserved
+as `compatibility_status=unbound`; an explicit mismatch is rejected rather than
+downgraded. A locked Job must require one `analysis_result_bundle` role.
+Runtime validates that bundle before `succeeded`: the seven fixed top-level
+fields, canonical result envelope shape, successful validation record,
+non-empty immutable input references, provenance, and every role/path/digest
+against the scanner manifest. The frozen credential-field names are rejected
+recursively. Runtime does not authorize data access or promote the candidate.
 
 ### IDE role and gateway
 
@@ -215,7 +240,7 @@ stateDiagram-v2
     Preparing --> Failed
     Preparing --> Lost
     Running --> CancelRequested
-    Running --> Succeeded: exit 0 and artifacts valid
+    Running --> Succeeded: exit 0, expected roles and Result Bundle valid
     Running --> Failed: nonzero exit or policy failure
     Running --> TimedOut
     Running --> Lost: executor missing
@@ -252,7 +277,9 @@ sequenceDiagram
     API->>J: Persist log chunks
     opt Successful worker exit
         API->>S: Networkless read-only artifact scan
-        S-->>API: Bounded manifest with hashes
+        S-->>API: Bounded manifest with roles and hashes
+        API->>E: Reopen Result Bundle bytes read-only
+        API->>API: Verify toolchain lock, immutable inputs, credentials and outputs
         API->>J: Replace artifact manifest
     end
     API->>J: Persist terminal state and exit code
@@ -481,17 +508,21 @@ exfiltration to reachable endpoints, or the contents of generated artifacts.
   an exact `workspace_refs` allowlist. Wildcards are invalid.
 - Use stable, owner-scoped idempotency keys and treat HTTP 429 and executor
   unavailability as retryable according to the error envelope.
-- Resolve governed project text files in OS, verify their project authorization,
-  and send only the bounded `workspace_files` payload. Never send a host path.
-- Poll Job terminal state and copy the operational result into OS's durable
-  Agent Run, Job and Artifact records.
+- Resolve governed project files in OS, verify their project authorization, and
+  send only bounded UTF-8/base64 `workspace_files`. Never send a host path.
+- Prefer an exact `compatibility_lock`; treat `unbound` as legacy execution, not
+  verified compatibility.
+- Poll Job terminal state, fetch candidate bytes through the authenticated
+  content endpoint, independently verify digests, then copy/promote them into
+  OS/DB durable records. Runtime success alone is not durable promotion.
 - Put IDE traffic on a separate origin, validate browser Origin/CSRF and strip OS
   auth cookies before calling Runtime's proxy path.
 
 ### Runtime to OS
 
-- Return opaque IDs, state, bounded logs, artifact manifests and proxy paths;
-  never return Docker IDs, host paths, loopback targets or Session secrets.
+- Return opaque IDs, state, bounded logs, artifact manifests, revalidated
+  candidate bytes and proxy paths; never return Docker IDs, host paths,
+  loopback targets or Session secrets.
 - Keep `/v1/health` dependent on the journal, executor and current egress-policy
   attestation so OS can stop admission when the worker boundary is unhealthy.
 - Preserve stable state names and error-envelope semantics within API V1.

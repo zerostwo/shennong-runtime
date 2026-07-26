@@ -255,7 +255,15 @@ public_request() {
 health_file="${tmp_dir}/health.json"
 info_file="${tmp_dir}/info.json"
 public_request /v1/health "${health_file}"
-jq -e '.status == "ok" and .journal == "ok" and .executor == "docker-rootless"' \
+jq -e '
+  .status == "ok"
+  and .journal == "ok"
+  and .executor == "docker-rootless"
+  and .r_toolchain_status == "verified"
+  and (.r_toolchain_sha256 | test("^[a-f0-9]{64}$"))
+  and (.package_commits.Shennong | test("^[a-f0-9]{40}$"))
+  and (.package_commits.ShennongData | test("^[a-f0-9]{40}$"))
+' \
   "${health_file}" >/dev/null || fail "Runtime health is not backed by the rootless executor"
 public_request /v1/info "${info_file}"
 jq -e --arg profile "${worker_profile}" '
@@ -263,6 +271,9 @@ jq -e --arg profile "${worker_profile}" '
   and .executor == "docker-rootless"
   and .network_policy == "internet_only"
   and (.worker_profiles | index($profile) != null)
+  and .r_toolchain.schema == "shennong.dev/runtime-r-toolchain/v1"
+  and (.r_toolchain_sha256 | test("^[a-f0-9]{64}$"))
+  and .r_toolchain.source_commits == .package_commits
 ' "${info_file}" >/dev/null || fail "Runtime info does not expose the requested rootless worker profile"
 
 make_resources() {
@@ -443,7 +454,7 @@ assert_success_outputs() {
   local label="$3"
   local artifact_path="$4"
   local expected_sha="$5"
-  local logs_file artifacts_file
+  local logs_file artifacts_file content_file artifact_id observed_sha
   logs_file="${tmp_dir}/logs-${job_id}.json"
   artifacts_file="${tmp_dir}/artifacts-${job_id}.json"
   request "${header_file}" GET "/v1/jobs/${job_id}/logs?after=0&limit=200" 200 "${logs_file}"
@@ -462,6 +473,13 @@ assert_success_outputs() {
     and .artifacts[0].sha256 == $digest
     and .artifacts[0].size_bytes > 0
   ' "${artifacts_file}" >/dev/null || fail "validated Artifact manifest or digest does not match"
+  artifact_id="$(jq -er '.artifacts[0].id' "${artifacts_file}")"
+  content_file="${tmp_dir}/artifact-content-${job_id}.bin"
+  request "${header_file}" GET \
+    "/v1/jobs/${job_id}/artifacts/${artifact_id}/content" 200 "${content_file}"
+  observed_sha="$(sha256sum "${content_file}" | awk '{print $1}')"
+  [[ "${observed_sha}" == "${expected_sha}" ]] \
+    || fail "revalidated Artifact content digest does not match"
 }
 
 assert_denied() {

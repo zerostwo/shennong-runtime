@@ -133,6 +133,7 @@ Contract and helper checks:
 openapi-spec-validator protocol/openapi.yaml
 bash -n scripts/*.sh
 python3 -c "import ast, pathlib; [ast.parse(p.read_text()) for p in pathlib.Path('container').rglob('*.py')]"
+python3 -m unittest discover -s container/worker -p 'test_*.py'
 docker compose --env-file deployments/docker/.env.example \
   --file deployments/docker/compose.rootless.yaml config --quiet
 ```

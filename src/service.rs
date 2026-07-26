@@ -4,6 +4,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use chrono::Utc;
 use globset::Glob;
 use sha2::{Digest, Sha256};
@@ -21,9 +22,12 @@ use crate::{
     journal::Journal,
     model::{
         ArtifactManifestEntry, ExecutorObservation, JobRecord, JobSpec, JobState, JobView,
-        LogEntry, LogStream, ResolvedJob, ResolvedSession, SessionRecord, SessionSpec,
-        SessionState, SessionView, WorkerProfile,
+        LogEntry, LogStream, MAX_ARTIFACT_DOWNLOAD_BYTES, MAX_ARTIFACTS, MAX_RESULT_BUNDLE_BYTES,
+        ResolvedJob, ResolvedSession, SessionRecord, SessionSpec, SessionState, SessionView,
+        WorkerProfile,
     },
+    result_bundle::validate_result_bundle,
+    toolchain::RuntimeToolchain,
 };
 
 pub struct AppState {
@@ -32,6 +36,7 @@ pub struct AppState {
     pub executor: Arc<dyn Executor>,
     pub jwt: JwtVerifier,
     pub proxy_client: reqwest::Client,
+    pub r_toolchain: Option<RuntimeToolchain>,
     job_slots: Arc<Semaphore>,
     session_slots: Arc<Semaphore>,
     job_monitors: Mutex<HashSet<Uuid>>,
@@ -83,12 +88,19 @@ impl AppState {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| RuntimeError::Internal(error.to_string()))?;
+        let r_toolchain = RuntimeToolchain::load(&config.r_toolchain_manifest_path)?;
+        if config.executor_kind == ExecutorKind::Docker && r_toolchain.is_none() {
+            return Err(RuntimeError::Validation(
+                "docker executor requires a verified R toolchain manifest".into(),
+            ));
+        }
         Ok(Self {
             config,
             journal,
             executor,
             jwt,
             proxy_client,
+            r_toolchain,
             job_slots,
             session_slots,
             job_monitors: Mutex::new(HashSet::new()),
@@ -517,6 +529,17 @@ impl AppState {
         validate_idempotency_key(idempotency_key)?;
         let profile = self.batch_profile(&spec.worker_profile)?.clone();
         spec.validate(&profile)?;
+        if let Some(compatibility_lock) = &spec.compatibility_lock {
+            self.r_toolchain
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Validation(
+                        "compatibility-locked Job requires an available R toolchain manifest"
+                            .into(),
+                    )
+                })?
+                .validate_lock(compatibility_lock)?;
+        }
         let request_hash = request_hash(&spec)?;
 
         if let Some(existing) = self
@@ -661,6 +684,45 @@ impl AppState {
         principal.require_scope("runtime:jobs:read")?;
         self.owned_job(principal, id).await?;
         self.journal.artifacts(id).await
+    }
+
+    pub async fn job_artifact_bytes(
+        &self,
+        principal: &Principal,
+        id: Uuid,
+        artifact_id: Uuid,
+    ) -> Result<(ArtifactManifestEntry, Bytes)> {
+        principal.require_scope("runtime:jobs:read")?;
+        let job = self.owned_job(principal, id).await?;
+        if job.view.state != JobState::Succeeded {
+            return Err(RuntimeError::Conflict(
+                "artifact bytes are available only after the Job succeeds".into(),
+            ));
+        }
+        let artifact = self
+            .journal
+            .artifacts(id)
+            .await?
+            .into_iter()
+            .find(|artifact| artifact.id == artifact_id)
+            .ok_or_else(|| RuntimeError::NotFound(format!("artifact {artifact_id}")))?;
+        let max_bytes = usize::try_from(job.spec.resources.max_artifact_bytes)
+            .unwrap_or(usize::MAX)
+            .min(MAX_ARTIFACT_DOWNLOAD_BYTES);
+        artifact.validate(max_bytes as i64)?;
+        let resolved = ResolvedJob {
+            id,
+            workspace_volume: workspace_volume_name(&job.spec.workspace_ref),
+            profile: self.batch_profile(&job.spec.worker_profile)?.clone(),
+            spec: job.spec,
+        };
+        let _executor_guard = self.executor_mutation.lock().await;
+        let bytes = self
+            .executor
+            .read_artifact(&resolved, &artifact, max_bytes)
+            .await?;
+        validate_artifact_bytes(&artifact, &bytes, max_bytes)?;
+        Ok((artifact, bytes))
     }
 
     pub async fn submit_session(
@@ -897,6 +959,17 @@ impl AppState {
         timeout_seconds: u64,
     ) -> Result<()> {
         let job = self.journal.job(job_id).await?;
+        if let Some(compatibility_lock) = &job.spec.compatibility_lock {
+            self.r_toolchain
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Validation(
+                        "compatibility-locked Job requires an available R toolchain manifest"
+                            .into(),
+                    )
+                })?
+                .validate_lock(compatibility_lock)?;
+        }
         let profile = self.batch_profile(&job.spec.worker_profile)?.clone();
         let resolved = ResolvedJob {
             id: job_id,
@@ -1051,11 +1124,17 @@ impl AppState {
         }
         let artifacts = if outcome.exit_code == 0 {
             let _executor_guard = self.executor_mutation.lock().await;
-            self.executor.collect_artifacts(&resolved).await?
+            let artifacts = self.executor.collect_artifacts(&resolved).await?;
+            validate_artifacts(&job.spec, &artifacts)?;
+            self.validate_job_result_bundle(&resolved, &artifacts)
+                .await?;
+            artifacts
         } else {
             Vec::new()
         };
-        validate_artifacts(&job.spec, &artifacts)?;
+        if outcome.exit_code != 0 {
+            validate_artifacts(&job.spec, &artifacts)?;
+        }
         self.journal.replace_artifacts(job_id, &artifacts).await?;
         let current = self.journal.job(job_id).await?;
         if current.view.state.is_terminal() {
@@ -1080,6 +1159,37 @@ impl AppState {
             )
             .await?;
         Ok(())
+    }
+
+    async fn validate_job_result_bundle(
+        &self,
+        job: &ResolvedJob,
+        artifacts: &[ArtifactManifestEntry],
+    ) -> Result<()> {
+        let bundles = artifacts
+            .iter()
+            .filter(|artifact| artifact.role.as_deref() == Some("analysis_result_bundle"))
+            .collect::<Vec<_>>();
+        if bundles.is_empty() {
+            return Ok(());
+        }
+        if bundles.len() != 1 {
+            return Err(RuntimeError::Validation(
+                "Job must produce exactly one analysis_result_bundle artifact".into(),
+            ));
+        }
+        let bundle = bundles[0];
+        if bundle.size_bytes < 0 || bundle.size_bytes as usize > MAX_RESULT_BUNDLE_BYTES {
+            return Err(RuntimeError::Validation(
+                "analysis Result Bundle exceeds the 16 MiB validation limit".into(),
+            ));
+        }
+        let bytes = self
+            .executor
+            .read_artifact(job, bundle, MAX_RESULT_BUNDLE_BYTES)
+            .await?;
+        validate_artifact_bytes(bundle, &bytes, MAX_RESULT_BUNDLE_BYTES)?;
+        validate_result_bundle(&bytes, bundle, artifacts)
     }
 
     fn schedule_session_expiry(self: &Arc<Self>, view: SessionView) {
@@ -1403,7 +1513,7 @@ fn ensure_same_request(existing: &str, requested: &str) -> Result<()> {
 }
 
 fn validate_artifacts(spec: &JobSpec, artifacts: &[ArtifactManifestEntry]) -> Result<()> {
-    if artifacts.len() > 256 {
+    if artifacts.len() > MAX_ARTIFACTS {
         return Err(RuntimeError::Validation(
             "worker returned too many artifacts".into(),
         ));
@@ -1422,6 +1532,10 @@ fn validate_artifacts(spec: &JobSpec, artifacts: &[ArtifactManifestEntry]) -> Re
             .ok_or_else(|| RuntimeError::Validation("artifact size overflow".into()))?;
         let allowed = spec.artifact_rules.iter().any(|rule| {
             rule.kind == artifact.kind
+                && rule
+                    .role
+                    .as_deref()
+                    .is_none_or(|role| artifact.role.as_deref() == Some(role))
                 && Glob::new(&rule.path)
                     .map(|glob| glob.compile_matcher().is_match(&artifact.relative_path))
                     .unwrap_or(false)
@@ -1436,6 +1550,43 @@ fn validate_artifacts(spec: &JobSpec, artifacts: &[ArtifactManifestEntry]) -> Re
     if total > spec.resources.max_artifact_bytes {
         return Err(RuntimeError::Validation(
             "artifact manifest exceeds max_artifact_bytes".into(),
+        ));
+    }
+    for rule in spec.artifact_rules.iter().filter(|rule| rule.required) {
+        let matched = artifacts.iter().any(|artifact| {
+            rule.kind == artifact.kind
+                && rule
+                    .role
+                    .as_deref()
+                    .is_none_or(|role| artifact.role.as_deref() == Some(role))
+                && Glob::new(&rule.path)
+                    .map(|glob| glob.compile_matcher().is_match(&artifact.relative_path))
+                    .unwrap_or(false)
+        });
+        if !matched {
+            return Err(RuntimeError::Validation(format!(
+                "required artifact rule {} was not produced",
+                rule.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_artifact_bytes(
+    artifact: &ArtifactManifestEntry,
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<()> {
+    if bytes.len() > max_bytes || bytes.len() as i64 != artifact.size_bytes {
+        return Err(RuntimeError::Validation(
+            "artifact bytes do not match the validated manifest size".into(),
+        ));
+    }
+    let digest = hex::encode(Sha256::digest(bytes));
+    if digest != artifact.sha256.to_ascii_lowercase() {
+        return Err(RuntimeError::Validation(
+            "artifact bytes do not match the validated manifest sha256".into(),
         ));
     }
     Ok(())

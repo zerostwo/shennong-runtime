@@ -12,6 +12,7 @@ default-run = "shennong-runtime"
 async-trait = "0.1"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
+base64 = "0.22"
 bollard = "0.18"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }

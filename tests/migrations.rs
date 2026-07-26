@@ -86,7 +86,7 @@ async fn upgrades_unversioned_database_and_backfills_runtime_columns() {
     let upgraded = SqlitePool::connect(&database_url)
         .await
         .expect("inspect upgraded database");
-    assert_eq!(schema_version(&upgraded).await, 2);
+    assert_eq!(schema_version(&upgraded).await, 3);
 
     let log_bytes: i64 = sqlx::query_scalar("SELECT log_bytes FROM jobs WHERE id = ?")
         .bind(JOB_ID)
@@ -116,6 +116,7 @@ async fn upgrades_unversioned_database_and_backfills_runtime_columns() {
     .await
     .expect("last activity constraint");
     assert_eq!(last_activity_not_null, 1);
+    assert!(column_exists(&upgraded, "artifacts", "role").await);
     upgraded.close().await;
 
     // A second startup must not re-run a data migration or duplicate columns.
@@ -126,7 +127,7 @@ async fn upgrades_unversioned_database_and_backfills_runtime_columns() {
     let reopened = SqlitePool::connect(&database_url)
         .await
         .expect("inspect reopened database");
-    assert_eq!(schema_version(&reopened).await, 2);
+    assert_eq!(schema_version(&reopened).await, 3);
     let log_bytes_after_reopen: i64 = sqlx::query_scalar("SELECT log_bytes FROM jobs WHERE id = ?")
         .bind(JOB_ID)
         .fetch_one(&reopened)
@@ -160,9 +161,9 @@ async fn upgrades_v1_database_without_rewriting_completed_job_migration() {
     drop(journal);
     let upgraded = SqlitePool::connect(&database_url)
         .await
-        .expect("inspect version 2 database");
+        .expect("inspect version 3 database");
 
-    assert_eq!(schema_version(&upgraded).await, 2);
+    assert_eq!(schema_version(&upgraded).await, 3);
     let log_bytes: i64 = sqlx::query_scalar("SELECT log_bytes FROM jobs WHERE id = ?")
         .bind(JOB_ID)
         .fetch_one(&upgraded)
@@ -174,9 +175,10 @@ async fn upgrades_v1_database_without_rewriting_completed_job_migration() {
             .bind(SESSION_ID)
             .fetch_one(&upgraded)
             .await
-            .expect("version 2 session activity");
+            .expect("version 3 session activity");
     assert_eq!(last_activity, UPDATED_AT);
     assert!(column_exists(&upgraded, "sessions", "internal_secret").await);
+    assert!(column_exists(&upgraded, "artifacts", "role").await);
 }
 
 #[tokio::test]
@@ -190,10 +192,11 @@ async fn fresh_database_keeps_canonical_schema_and_records_latest_version() {
         .await
         .expect("inspect fresh database");
 
-    assert_eq!(schema_version(&pool).await, 2);
+    assert_eq!(schema_version(&pool).await, 3);
     assert!(column_exists(&pool, "jobs", "log_bytes").await);
     assert!(column_exists(&pool, "sessions", "last_activity_at").await);
     assert!(column_exists(&pool, "sessions", "internal_secret").await);
+    assert!(column_exists(&pool, "artifacts", "role").await);
     let default_value: Option<String> = sqlx::query_scalar(
         "SELECT dflt_value FROM pragma_table_info('sessions') WHERE name = 'last_activity_at'",
     )
@@ -278,6 +281,7 @@ async fn column_exists(pool: &SqlitePool, table: &str, column: &str) -> bool {
     let statement = match table {
         "jobs" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('jobs') WHERE name = ?)",
         "sessions" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = ?)",
+        "artifacts" => "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifacts') WHERE name = ?)",
         _ => panic!("unsupported test table {table}"),
     };
     sqlx::query_scalar(statement)

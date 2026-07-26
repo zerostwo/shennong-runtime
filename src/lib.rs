@@ -6,7 +6,9 @@ pub mod executor;
 pub mod journal;
 pub mod model;
 pub mod proxy;
+pub mod result_bundle;
 pub mod service;
+pub mod toolchain;
 
 pub use api::router;
 pub use config::RuntimeConfig;

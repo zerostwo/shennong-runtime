@@ -92,6 +92,7 @@ jobs:
         run: |
           bash -n scripts/*.sh
           python3 -c "import ast, pathlib; [ast.parse(path.read_text()) for path in pathlib.Path('container').rglob('*.py')]"
+          python3 -m unittest discover -s container/worker -p 'test_*.py'
 
   secrets:
     name: Secret scan

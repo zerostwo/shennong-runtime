@@ -16,7 +16,10 @@ RUN apt-get update \
 COPY --from=pixi /usr/local/bin/pixi /usr/local/bin/pixi
 COPY container/worker/job_entrypoint.py /opt/shennong/bin/job_entrypoint.py
 COPY container/worker/scan_artifacts.py /opt/shennong/bin/scan_artifacts.py
-RUN chmod 0555 /opt/shennong/bin/job_entrypoint.py /opt/shennong/bin/scan_artifacts.py
+COPY container/worker/read_artifact.py /opt/shennong/bin/read_artifact.py
+RUN chmod 0555 /opt/shennong/bin/job_entrypoint.py \
+    /opt/shennong/bin/read_artifact.py \
+    /opt/shennong/bin/scan_artifacts.py
 ENV PYTHONDONTWRITEBYTECODE=1 \
     HOME=/workspace/.shennong/home
 USER 65532:65532

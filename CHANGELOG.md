@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Skills, and their read-only MCP servers in the unified Runtime image, with
   build-time JSON-RPC smoke tests and a machine-readable toolchain inventory
   exposed through `GET /v1/info`.
+- Add backward-compatible Job compatibility locks for the fixed Shennong
+  Result Bundle v1 schema, canonical Runtime toolchain manifest digest, and
+  exact Shennong/ShennongData version and source-commit pins. Legacy requests
+  without a lock are explicitly reported as `unbound`.
+- Add digest-verified UTF-8/base64 workspace staging, required Artifact roles,
+  pre-success Result Bundle validation, and an authenticated bounded endpoint
+  for revalidated candidate Artifact bytes.
 
 ### Changed
 
@@ -34,11 +41,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ownership, Job/Session lifecycles, deployment modes, residual risks and
   cross-repository contracts, with a visual architecture map in the README and
   repository-specific agent guidance.
+- Record Artifact roles in journal schema v3 and expose the canonical
+  toolchain-manifest SHA-256 and actual package source commits through health
+  and info responses.
 
 ### Fixed
 
 - Treat Docker's container-removal-already-in-progress conflict as an
   idempotent IDE Session stop while preserving failures for unrelated conflicts.
+
+### Security
+
+- Reject explicit toolchain/package lock mismatches, missing immutable Result
+  Bundle inputs, mismatched output roles/digests, and recursively normalized
+  credential fields before a Job can succeed.
+- Read Artifact content only from the owning Job volume through a networkless
+  read-only no-follow helper, then revalidate regular-file size and SHA-256 in
+  the daemon. Runtime still holds no DB credential and performs no promotion.
+- Hash scanner outputs through directory-relative no-follow file descriptors so
+  concurrent workspace path replacement cannot redirect manifest validation.
 
 ## [1.0.0] - 2026-07-18
 

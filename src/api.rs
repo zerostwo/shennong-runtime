@@ -4,9 +4,12 @@ use axum::{
     Extension, Json, Router,
     body::Body,
     extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode, header::HeaderName},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName},
+    },
     middleware,
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +36,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/jobs/{id}/logs", get(job_logs))
         .route("/v1/jobs/{id}/artifacts", get(job_artifacts))
+        .route(
+            "/v1/jobs/{id}/artifacts/{artifact_id}/content",
+            get(job_artifact_content),
+        )
         .route("/v1/sessions", post(submit_session))
         .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/sessions/{id}/stop", post(stop_session))
@@ -48,7 +55,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(public)
         .merge(protected)
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(128 * 1024))
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .with_state(state)
 }
@@ -56,10 +63,18 @@ pub fn router(state: Arc<AppState>) -> Router {
 async fn health(State(state): State<Arc<AppState>>) -> Result<Json<HealthResponse>> {
     state.journal.ping().await?;
     state.executor.ping().await?;
+    let toolchain = state.r_toolchain.as_ref();
     Ok(Json(HealthResponse {
         status: "ok",
         journal: "ok",
         executor: state.executor.name(),
+        r_toolchain_status: if toolchain.is_some() {
+            "verified"
+        } else {
+            "unavailable"
+        },
+        r_toolchain_sha256: toolchain.map(|toolchain| toolchain.sha256.clone()),
+        package_commits: toolchain.map(|toolchain| toolchain.manifest.source_commits.clone()),
     }))
 }
 
@@ -73,7 +88,18 @@ async fn info(State(state): State<Arc<AppState>>) -> Json<InfoResponse> {
         executor: state.executor.name(),
         worker_profiles: profiles,
         network_policy: "internet_only",
-        r_toolchain: runtime_r_toolchain_manifest(),
+        r_toolchain: state
+            .r_toolchain
+            .as_ref()
+            .map(|toolchain| toolchain.manifest.clone()),
+        r_toolchain_sha256: state
+            .r_toolchain
+            .as_ref()
+            .map(|toolchain| toolchain.sha256.clone()),
+        package_commits: state
+            .r_toolchain
+            .as_ref()
+            .map(|toolchain| toolchain.manifest.source_commits.clone()),
     })
 }
 
@@ -139,6 +165,26 @@ async fn job_artifacts(
     }))
 }
 
+async fn job_artifact_content(
+    State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<Principal>,
+    Path((id, artifact_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response<Body>> {
+    let (artifact, bytes) = state
+        .job_artifact_bytes(&principal, id, artifact_id)
+        .await?;
+    let digest = HeaderValue::from_str(&artifact.sha256).map_err(|_| {
+        RuntimeError::Internal("stored artifact sha256 is not a header value".into())
+    })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(CONTENT_LENGTH, bytes.len())
+        .header("x-content-sha256", digest)
+        .body(Body::from(bytes))
+        .map_err(|error| RuntimeError::Internal(error.to_string()))
+}
+
 async fn submit_session(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<Principal>,
@@ -190,6 +236,9 @@ struct HealthResponse {
     status: &'static str,
     journal: &'static str,
     executor: &'static str,
+    r_toolchain_status: &'static str,
+    r_toolchain_sha256: Option<String>,
+    package_commits: Option<crate::toolchain::SourceCommits>,
 }
 
 #[derive(Serialize)]
@@ -200,50 +249,9 @@ struct InfoResponse {
     executor: &'static str,
     worker_profiles: Vec<String>,
     network_policy: &'static str,
-    r_toolchain: Option<serde_json::Value>,
-}
-
-fn runtime_r_toolchain_manifest() -> Option<serde_json::Value> {
-    let path = std::env::var("SHENNONG_R_TOOLCHAIN_MANIFEST")
-        .unwrap_or_else(|_| "/opt/shennong/runtime-r-toolchain.json".into());
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() > 64 * 1024 {
-        return None;
-    }
-    parse_runtime_r_toolchain_manifest(&bytes)
-}
-
-fn parse_runtime_r_toolchain_manifest(bytes: &[u8]) -> Option<serde_json::Value> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    if value.get("schema").and_then(serde_json::Value::as_str)
-        != Some("shennong.dev/runtime-r-toolchain/v1")
-        || !value
-            .pointer("/packages/Shennong")
-            .is_some_and(serde_json::Value::is_string)
-        || !value
-            .pointer("/packages/ShennongData")
-            .is_some_and(serde_json::Value::is_string)
-    {
-        return None;
-    }
-    Some(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_runtime_r_toolchain_manifest;
-
-    #[test]
-    fn r_toolchain_info_accepts_only_the_verified_manifest_shape() {
-        let valid = br#"{
-          "schema":"shennong.dev/runtime-r-toolchain/v1",
-          "packages":{"Shennong":"0.2.0.9000","ShennongData":"0.2.0"},
-          "mcp":{},"skills":[]
-        }"#;
-        assert!(parse_runtime_r_toolchain_manifest(valid).is_some());
-        assert!(parse_runtime_r_toolchain_manifest(br#"{"schema":"other"}"#).is_none());
-        assert!(parse_runtime_r_toolchain_manifest(b"not-json").is_none());
-    }
+    r_toolchain: Option<crate::toolchain::RToolchainManifest>,
+    r_toolchain_sha256: Option<String>,
+    package_commits: Option<crate::toolchain::SourceCommits>,
 }
 
 #[derive(Deserialize)]
@@ -263,5 +271,3 @@ struct LogPage {
 struct ArtifactPage {
     artifacts: Vec<ArtifactManifestEntry>,
 }
-
-use axum::response::IntoResponse;

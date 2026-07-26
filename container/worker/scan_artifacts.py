@@ -25,11 +25,15 @@ ALLOWED_KINDS = {
 }
 
 
-def validate_rule(rule: object) -> tuple[str, str]:
-    if not isinstance(rule, dict) or set(rule) != {"path", "kind"}:
+def validate_rule(rule: object) -> tuple[str, str, str | None]:
+    if not isinstance(rule, dict) or not {"path", "kind"} <= set(rule):
+        raise ValueError("artifact rule has unexpected fields")
+    if set(rule) - {"path", "kind", "role", "required"}:
         raise ValueError("artifact rule has unexpected fields")
     pattern = rule["path"]
     kind = rule["kind"]
+    role = rule.get("role")
+    required = rule.get("required", False)
     if not isinstance(pattern, str) or not pattern or len(pattern) > 512:
         raise ValueError("artifact path pattern is invalid")
     path = pathlib.PurePosixPath(pattern)
@@ -37,27 +41,62 @@ def validate_rule(rule: object) -> tuple[str, str]:
         raise ValueError("artifact path must remain under /workspace")
     if kind not in ALLOWED_KINDS:
         raise ValueError("artifact kind is invalid")
-    return pattern, kind
+    if role is not None and (
+        not isinstance(role, str)
+        or not role
+        or len(role) > 64
+        or any(not (character.isalnum() or character in "-_.") for character in role)
+    ):
+        raise ValueError("artifact role is invalid")
+    if not isinstance(required, bool):
+        raise ValueError("artifact required flag is invalid")
+    return pattern, kind, role
 
 
-def reject_symlink_path(workspace: pathlib.Path, relative: pathlib.Path) -> None:
-    current = workspace
-    for part in relative.parts:
-        current = current / part
-        if stat.S_ISLNK(os.lstat(current).st_mode):
-            raise ValueError(f"symlink artifacts are forbidden: {relative}")
+def open_regular(workspace: int, relative: pathlib.Path) -> tuple[int, os.stat_result]:
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError(f"artifact path must remain below /workspace: {relative}")
+    directory = os.dup(workspace)
+    artifact = None
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            os.close(directory)
+            directory = child
+        artifact = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory,
+        )
+        metadata = os.fstat(artifact)
+        if not stat.S_ISREG(metadata.st_mode):
+            if stat.S_ISDIR(metadata.st_mode):
+                raise IsADirectoryError(f"artifact match is a directory: {relative}")
+            raise ValueError(f"artifact must be a regular file: {relative}")
+        return artifact, metadata
+    except Exception:
+        if artifact is not None:
+            os.close(artifact)
+        raise
+    finally:
+        os.close(directory)
 
 
-def sha256(path: pathlib.Path) -> str:
+def sha256(descriptor: int) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
 
 
 def main() -> None:
-    workspace = pathlib.Path("/workspace").resolve(strict=True)
+    workspace_path = pathlib.Path("/workspace")
+    workspace = os.open(workspace_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     raw_rules = json.loads(os.environ.get("SHENNONG_ARTIFACT_RULES_JSON", "[]"))
     if not isinstance(raw_rules, list) or len(raw_rules) > 64:
         raise ValueError("artifact rules must be a bounded list")
@@ -69,37 +108,49 @@ def main() -> None:
     seen: set[str] = set()
     total = 0
     visited = 0
-    for raw_rule in raw_rules:
-        pattern, kind = validate_rule(raw_rule)
-        for value in glob.iglob(pattern, root_dir=workspace, recursive=True, include_hidden=True):
-            visited += 1
-            if visited > 4096:
-                raise ValueError("artifact scan matched more than 4096 paths")
-            relative = pathlib.Path(value)
-            if str(relative) in seen:
-                continue
-            reject_symlink_path(workspace, relative)
-            candidate = (workspace / relative).resolve(strict=True)
-            candidate.relative_to(workspace)
-            if not candidate.is_file():
-                continue
-            size = candidate.stat().st_size
-            total += size
-            if total > max_bytes:
-                raise ValueError("artifact manifest exceeds max_artifact_bytes")
-            seen.add(str(relative))
-            entries.append(
-                {
-                    "id": str(uuid.uuid4()),
-                    "relative_path": relative.as_posix(),
-                    "kind": kind,
-                    "size_bytes": size,
-                    "sha256": sha256(candidate),
-                    "media_type": mimetypes.guess_type(candidate.name)[0],
-                }
-            )
-            if len(entries) > 256:
-                raise ValueError("artifact manifest contains more than 256 files")
+    try:
+        for raw_rule in raw_rules:
+            pattern, kind, role = validate_rule(raw_rule)
+            for value in glob.iglob(
+                pattern,
+                root_dir=workspace_path,
+                recursive=True,
+                include_hidden=True,
+            ):
+                visited += 1
+                if visited > 4096:
+                    raise ValueError("artifact scan matched more than 4096 paths")
+                relative = pathlib.Path(value)
+                if str(relative) in seen:
+                    continue
+                descriptor = None
+                try:
+                    descriptor, metadata = open_regular(workspace, relative)
+                except IsADirectoryError:
+                    continue
+                try:
+                    size = metadata.st_size
+                    total += size
+                    if total > max_bytes:
+                        raise ValueError("artifact manifest exceeds max_artifact_bytes")
+                    seen.add(str(relative))
+                    entries.append(
+                        {
+                            "id": str(uuid.uuid4()),
+                            "relative_path": relative.as_posix(),
+                            "kind": kind,
+                            "size_bytes": size,
+                            "sha256": sha256(descriptor),
+                            "media_type": mimetypes.guess_type(relative.name)[0],
+                            "role": role,
+                        }
+                    )
+                    if len(entries) > 256:
+                        raise ValueError("artifact manifest contains more than 256 files")
+                finally:
+                    os.close(descriptor)
+    finally:
+        os.close(workspace)
     json.dump(entries, sys.stdout, separators=(",", ":"), sort_keys=True)
 
 

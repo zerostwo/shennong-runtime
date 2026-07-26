@@ -9,7 +9,7 @@ repos <- c(CRAN = "https://cloud.r-project.org")
 options(repos = repos, timeout = 600)
 
 hard_dependencies <- c(
-  "cli", "curl", "dplyr", "ggplot2", "glue", "jsonlite", "logger",
+  "cli", "curl", "digest", "dplyr", "ggplot2", "glue", "jsonlite", "logger",
   "rlang", "tictoc", "RColorBrewer", "stringr", "tibble", "S7", "httr2"
 )
 missing <- hard_dependencies[
@@ -38,7 +38,7 @@ install_local <- function(path) {
 install_local(normalizePath(args[[2L]], mustWork = TRUE))
 install_local(normalizePath(args[[1L]], mustWork = TRUE))
 
-expected <- c(Shennong = "0.2.0.9000", ShennongData = "0.2.0")
+expected <- c(Shennong = "0.2.0.9000", ShennongData = "0.2.0.9000")
 observed <- vapply(names(expected), function(package) {
   if (!requireNamespace(package, quietly = TRUE)) stop(package, " is unavailable")
   as.character(utils::packageVersion(package))
@@ -46,4 +46,3 @@ observed <- vapply(names(expected), function(package) {
 if (!identical(observed, expected)) {
   stop("unexpected Shennong package versions: ", paste(names(observed), observed, collapse = ", "))
 }
-

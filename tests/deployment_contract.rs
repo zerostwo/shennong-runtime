@@ -89,13 +89,15 @@ fn unified_image_pins_and_smoke_tests_the_shennong_r_toolchain() {
     for required in [
         "ARG R_VERSION_SERIES=4.6",
         "bookworm-cran46/",
-        "ARG SHENNONG_REF=8a2a3a334098983674082fa323df3c6f8e927e5b",
-        "ARG SHENNONG_DATA_REF=b560e1d68429b74cf688c23e4b6b6700d68d9d2b",
+        "ARG SHENNONG_REF=c1d958db3319f635ff5d6f9ad484a208774a4a39",
+        "ARG SHENNONG_DATA_REF=17f0f0e87dd8ad2a3751dd11c58c8aa43823aa69",
         "SHENNONG_TARBALL_SHA256",
         "SHENNONG_DATA_TARBALL_SHA256",
         "sha256sum --check --strict",
         "install-shennong-r-packages.R",
         "verify-shennong-r-toolchain.R",
+        "SHENNONG_REF=\"${SHENNONG_REF}\"",
+        "SHENNONG_DATA_REF=\"${SHENNONG_DATA_REF}\"",
         "/opt/shennong/agent/skills/shennong-data",
     ] {
         assert!(
@@ -109,6 +111,44 @@ fn unified_image_pins_and_smoke_tests_the_shennong_r_toolchain() {
     assert!(verifier.contains("ShennongData::sn_mcp_serve"));
     assert!(verifier.contains("protocolVersion = \"2025-11-25\""));
     assert!(verifier.contains("readOnlyHint"));
+    assert!(verifier.contains("source_commits"));
+    assert!(verifier.contains("^[0-9a-f]{40}$"));
+}
+
+#[test]
+fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
+    let reader = read("container/worker/read_artifact.py");
+    for required in [
+        "os.O_NOFOLLOW",
+        "dir_fd=directory",
+        "stat.S_ISREG",
+        "expected_size > max_bytes",
+        "copied > max_bytes",
+        "digest.hexdigest() != expected_sha256",
+    ] {
+        assert!(
+            reader.contains(required),
+            "missing artifact-reader guard: {required}"
+        );
+    }
+}
+
+#[test]
+fn runtime_skill_preserves_the_compatibility_and_db_boundaries() {
+    let skill = read(".agents/skills/shennong-runtime/SKILL.md");
+    for required in [
+        "shennong.dev/analysis-result-bundle/v1",
+        "r_toolchain_sha256",
+        "compatibility_status=unbound",
+        "X-Content-Sha256",
+        "Never give Runtime or a workload ShennongDB credentials",
+        "does not prove OS/DB upload",
+    ] {
+        assert!(
+            skill.contains(required),
+            "missing Runtime Skill rule: {required}"
+        );
+    }
 }
 
 #[test]

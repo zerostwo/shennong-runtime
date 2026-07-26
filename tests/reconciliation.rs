@@ -38,6 +38,7 @@ async fn startup_marks_unpersisted_executor_job_lost() {
         network: NetworkPolicy::InternetOnly,
         workspace_files: vec![],
         artifact_rules: Vec::<ArtifactRule>::new(),
+        compatibility_lock: None,
     };
     let job = state
         .journal

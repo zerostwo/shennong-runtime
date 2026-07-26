@@ -13,6 +13,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
+use bytes::Bytes;
 use chrono::Utc;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use shennong_runtime::{
@@ -96,6 +97,15 @@ impl Executor for ControlledExecutor {
 
     async fn collect_artifacts(&self, _job: &ResolvedJob) -> Result<Vec<ArtifactManifestEntry>> {
         Ok(Vec::new())
+    }
+
+    async fn read_artifact(
+        &self,
+        _job: &ResolvedJob,
+        _artifact: &ArtifactManifestEntry,
+        _max_bytes: usize,
+    ) -> Result<Bytes> {
+        Err(RuntimeError::NotFound("controlled test artifact".into()))
     }
 
     async fn cancel_job(&self, executor_id: &str) -> Result<()> {
@@ -466,6 +476,7 @@ fn job_spec() -> JobSpec {
         network: NetworkPolicy::InternetOnly,
         workspace_files: vec![],
         artifact_rules: Vec::<ArtifactRule>::new(),
+        compatibility_lock: None,
     }
 }
 

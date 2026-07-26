@@ -65,6 +65,7 @@ pub struct RuntimeConfig {
     pub max_concurrent_jobs: usize,
     pub max_concurrent_sessions: usize,
     pub monitor_interval: Duration,
+    pub r_toolchain_manifest_path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -179,6 +180,9 @@ impl RuntimeConfig {
             max_concurrent_jobs: parse_concurrency("SHENNONG_MAX_CONCURRENT_JOBS", 4, 256)?,
             max_concurrent_sessions: parse_concurrency("SHENNONG_MAX_CONCURRENT_SESSIONS", 2, 64)?,
             monitor_interval: Duration::from_millis(parse_monitor_interval()?),
+            r_toolchain_manifest_path: env::var_os("SHENNONG_R_TOOLCHAIN_MANIFEST")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/opt/shennong/runtime-r-toolchain.json")),
         })
     }
 
@@ -203,6 +207,9 @@ impl RuntimeConfig {
             max_concurrent_jobs: 4,
             max_concurrent_sessions: 2,
             monitor_interval: Duration::from_millis(20),
+            r_toolchain_manifest_path: PathBuf::from(
+                "/nonexistent/shennong-runtime-test-toolchain.json",
+            ),
         }
     }
 }

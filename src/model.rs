@@ -1,11 +1,21 @@
 use std::{collections::HashSet, path::Path};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{Result, RuntimeError};
+
+pub const RESULT_BUNDLE_SCHEMA: &str = "shennong.dev/analysis-result-bundle/v1";
+pub const R_TOOLCHAIN_SCHEMA: &str = "shennong.dev/runtime-r-toolchain/v1";
+pub const MAX_WORKSPACE_FILES: usize = 32;
+pub const MAX_WORKSPACE_FILE_BYTES: usize = 1024 * 1024;
+pub const MAX_WORKSPACE_STAGING_BYTES: usize = 1024 * 1024;
+pub const MAX_ARTIFACTS: usize = 256;
+pub const MAX_ARTIFACT_DOWNLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_RESULT_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -143,12 +153,27 @@ pub struct JobSpec {
     pub workspace_files: Vec<WorkspaceFile>,
     #[serde(default)]
     pub artifact_rules: Vec<ArtifactRule>,
+    #[serde(default)]
+    pub compatibility_lock: Option<CompatibilityLock>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFileEncoding {
+    Utf8,
+    Base64,
+}
+
+fn default_workspace_file_encoding() -> WorkspaceFileEncoding {
+    WorkspaceFileEncoding::Utf8
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceFile {
     pub path: String,
+    #[serde(default = "default_workspace_file_encoding")]
+    pub encoding: WorkspaceFileEncoding,
     pub content: String,
     pub sha256: String,
 }
@@ -169,17 +194,39 @@ impl WorkspaceFile {
                 "workspace input path must identify a regular project file".into(),
             ));
         }
-        if self.content.len() > 1_048_576
-            || self.sha256.len() != 64
+        let bytes = self.decoded_bytes()?;
+        if self.sha256.len() != 64
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || hex::encode(Sha256::digest(self.content.as_bytes()))
-                != self.sha256.to_ascii_lowercase()
+            || hex::encode(Sha256::digest(&bytes)) != self.sha256.to_ascii_lowercase()
         {
             return Err(RuntimeError::Validation(
                 "workspace input content or sha256 is invalid".into(),
             ));
         }
         Ok(())
+    }
+
+    pub fn decoded_bytes(&self) -> Result<Vec<u8>> {
+        let max_encoded = MAX_WORKSPACE_FILE_BYTES.div_ceil(3) * 4;
+        if self.content.len() > max_encoded {
+            return Err(RuntimeError::Validation(
+                "workspace input exceeds the per-file staging limit".into(),
+            ));
+        }
+        let bytes = match self.encoding {
+            WorkspaceFileEncoding::Utf8 => self.content.as_bytes().to_vec(),
+            WorkspaceFileEncoding::Base64 => BASE64_STANDARD
+                .decode(self.content.as_bytes())
+                .map_err(|_| {
+                    RuntimeError::Validation("workspace input base64 is invalid".into())
+                })?,
+        };
+        if bytes.len() > MAX_WORKSPACE_FILE_BYTES {
+            return Err(RuntimeError::Validation(
+                "workspace input exceeds the per-file staging limit".into(),
+            ));
+        }
+        Ok(bytes)
     }
 }
 
@@ -206,21 +253,23 @@ impl JobSpec {
         for rule in &self.artifact_rules {
             rule.validate()?;
         }
-        if self.workspace_files.len() > 32
-            || self
-                .workspace_files
-                .iter()
-                .map(|file| file.content.len())
-                .sum::<usize>()
-                > 1_048_576
-        {
+        if self.workspace_files.len() > MAX_WORKSPACE_FILES {
             return Err(RuntimeError::Validation(
                 "workspace inputs exceed the 32-file or 1 MiB staging limit".into(),
             ));
         }
         let mut paths = HashSet::new();
+        let mut staged_bytes = 0_usize;
         for file in &self.workspace_files {
             file.validate()?;
+            staged_bytes = staged_bytes
+                .checked_add(file.decoded_bytes()?.len())
+                .ok_or_else(|| RuntimeError::Validation("workspace input size overflow".into()))?;
+            if staged_bytes > MAX_WORKSPACE_STAGING_BYTES {
+                return Err(RuntimeError::Validation(
+                    "workspace inputs exceed the 32-file or 1 MiB staging limit".into(),
+                ));
+            }
             if !paths.insert(file.path.as_str()) {
                 return Err(RuntimeError::Validation(
                     "workspace input paths must be unique".into(),
@@ -237,6 +286,20 @@ impl JobSpec {
                 }
             }
         }
+        if let Some(compatibility_lock) = &self.compatibility_lock {
+            compatibility_lock.validate()?;
+            let result_bundle_rules = self
+                .artifact_rules
+                .iter()
+                .filter(|rule| rule.role.as_deref() == Some("analysis_result_bundle"))
+                .collect::<Vec<_>>();
+            if result_bundle_rules.len() != 1 || !result_bundle_rules[0].required {
+                return Err(RuntimeError::Validation(
+                    "a compatibility-locked Job requires exactly one required analysis_result_bundle artifact rule"
+                        .into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -246,12 +309,95 @@ impl JobSpec {
 pub struct ArtifactRule {
     pub path: String,
     pub kind: ArtifactKind,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl ArtifactRule {
     pub fn validate(&self) -> Result<()> {
-        validate_workspace_relative_path(&self.path)
+        validate_workspace_relative_path(&self.path)?;
+        if let Some(role) = &self.role {
+            validate_identifier("artifact role", role, 64)?;
+        }
+        Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityLock {
+    pub result_bundle_schema: String,
+    pub runtime_toolchain: RuntimeToolchainLock,
+    pub packages: CompatibilityPackages,
+}
+
+impl CompatibilityLock {
+    pub fn validate(&self) -> Result<()> {
+        if self.result_bundle_schema != RESULT_BUNDLE_SCHEMA {
+            return Err(RuntimeError::Validation(format!(
+                "result_bundle_schema must be {RESULT_BUNDLE_SCHEMA}"
+            )));
+        }
+        self.runtime_toolchain.validate()?;
+        self.packages.validate()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeToolchainLock {
+    pub schema: String,
+    pub sha256: String,
+}
+
+impl RuntimeToolchainLock {
+    fn validate(&self) -> Result<()> {
+        if self.schema != R_TOOLCHAIN_SCHEMA {
+            return Err(RuntimeError::Validation(format!(
+                "runtime toolchain schema must be {R_TOOLCHAIN_SCHEMA}"
+            )));
+        }
+        validate_sha256("runtime toolchain sha256", &self.sha256)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityPackages {
+    #[serde(rename = "Shennong")]
+    pub shennong: CompatibilityPackage,
+    #[serde(rename = "ShennongData")]
+    pub shennong_data: CompatibilityPackage,
+}
+
+impl CompatibilityPackages {
+    fn validate(&self) -> Result<()> {
+        self.shennong.validate("Shennong")?;
+        self.shennong_data.validate("ShennongData")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompatibilityPackage {
+    pub version: String,
+    pub commit: String,
+}
+
+impl CompatibilityPackage {
+    fn validate(&self, name: &str) -> Result<()> {
+        validate_identifier(&format!("{name} version"), &self.version, 128)?;
+        validate_commit(&format!("{name} commit"), &self.commit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompatibilityStatus {
+    Unbound,
+    Verified,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -473,6 +619,7 @@ pub struct JobView {
     pub exit_code: Option<i64>,
     pub error: Option<String>,
     pub log_truncated: bool,
+    pub compatibility_status: CompatibilityStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -537,11 +684,28 @@ pub struct ArtifactManifestEntry {
     pub size_bytes: i64,
     pub sha256: String,
     pub media_type: Option<String>,
+    pub role: Option<String>,
 }
 
 impl ArtifactManifestEntry {
     pub fn validate(&self, max_size: i64) -> Result<()> {
         validate_workspace_relative_path(&self.relative_path)?;
+        if self.relative_path == "."
+            || self.relative_path.ends_with('/')
+            || self.relative_path.contains('\\')
+            || self
+                .relative_path
+                .chars()
+                .any(|character| matches!(character, '\0' | '\r' | '\n'))
+            || self
+                .relative_path
+                .split('/')
+                .any(|component| component.is_empty() || component == ".")
+        {
+            return Err(RuntimeError::Validation(
+                "artifact path must identify a regular workspace file".into(),
+            ));
+        }
         if self.size_bytes < 0 || self.size_bytes > max_size {
             return Err(RuntimeError::Validation(
                 "artifact exceeds size policy".into(),
@@ -551,6 +715,9 @@ impl ArtifactManifestEntry {
             return Err(RuntimeError::Validation(
                 "artifact sha256 is invalid".into(),
             ));
+        }
+        if let Some(role) = &self.role {
+            validate_identifier("artifact role", role, 64)?;
         }
         Ok(())
     }
@@ -669,7 +836,7 @@ fn validate_argv(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn validate_workspace_relative_path(value: &str) -> Result<()> {
+pub(crate) fn validate_workspace_relative_path(value: &str) -> Result<()> {
     let path = Path::new(value);
     if value.is_empty()
         || value.len() > 512
@@ -684,6 +851,26 @@ fn validate_workspace_relative_path(value: &str) -> Result<()> {
         return Err(RuntimeError::Validation(
             "artifact paths must remain relative to /workspace".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_sha256(label: &str, value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(RuntimeError::Validation(format!("invalid {label}")));
+    }
+    Ok(())
+}
+
+fn validate_commit(label: &str, value: &str) -> Result<()> {
+    if value.len() != 40
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(RuntimeError::Validation(format!("invalid {label}")));
     }
     Ok(())
 }

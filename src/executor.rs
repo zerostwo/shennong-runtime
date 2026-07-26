@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use bollard::{
     Docker,
     container::{
-        Config as ContainerConfig, CreateContainerOptions, InspectContainerOptions,
-        KillContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
-        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+        Config as ContainerConfig, CreateContainerOptions, DownloadFromContainerOptions,
+        InspectContainerOptions, KillContainerOptions, ListContainersOptions, LogOutput,
+        LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
         UploadToContainerOptions,
     },
     errors::Error as BollardError,
@@ -188,6 +188,12 @@ pub trait Executor: Send + Sync {
     async fn start_job(&self, job: &ResolvedJob) -> Result<String>;
     async fn wait_job(&self, executor_id: &str, job: &ResolvedJob) -> Result<ExecutionOutcome>;
     async fn collect_artifacts(&self, job: &ResolvedJob) -> Result<Vec<ArtifactManifestEntry>>;
+    async fn read_artifact(
+        &self,
+        job: &ResolvedJob,
+        artifact: &ArtifactManifestEntry,
+        max_bytes: usize,
+    ) -> Result<Bytes>;
     async fn cancel_job(&self, executor_id: &str) -> Result<()>;
     async fn observe_job(&self, executor_id: &str) -> Result<ExecutorObservation>;
     async fn cleanup_job(&self, executor_id: &str) -> Result<()>;
@@ -268,22 +274,45 @@ impl Executor for MockExecutor {
     }
 
     async fn collect_artifacts(&self, job: &ResolvedJob) -> Result<Vec<ArtifactManifestEntry>> {
-        if !job
-            .spec
-            .artifact_rules
-            .iter()
-            .any(|rule| rule.path == "results/mock-result.txt")
-        {
-            return Ok(Vec::new());
+        let mut artifacts = Vec::new();
+        for rule in &job.spec.artifact_rules {
+            let Some(bytes) = mock_artifact_bytes(job, &rule.path) else {
+                continue;
+            };
+            artifacts.push(ArtifactManifestEntry {
+                id: Uuid::new_v4(),
+                relative_path: rule.path.clone(),
+                kind: rule.kind.clone(),
+                size_bytes: bytes.len() as i64,
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                media_type: if rule.path.ends_with(".json") {
+                    Some("application/json".into())
+                } else {
+                    Some("text/plain".into())
+                },
+                role: rule.role.clone(),
+            });
         }
-        Ok(vec![ArtifactManifestEntry {
-            id: Uuid::new_v4(),
-            relative_path: "results/mock-result.txt".into(),
-            kind: crate::model::ArtifactKind::Other,
-            size_bytes: 14,
-            sha256: hex::encode(Sha256::digest(b"mock artifact\n")),
-            media_type: Some("text/plain".into()),
-        }])
+        Ok(artifacts)
+    }
+
+    async fn read_artifact(
+        &self,
+        job: &ResolvedJob,
+        artifact: &ArtifactManifestEntry,
+        max_bytes: usize,
+    ) -> Result<Bytes> {
+        let mut bytes = mock_artifact_bytes(job, &artifact.relative_path)
+            .ok_or_else(|| RuntimeError::NotFound("mock artifact bytes".into()))?;
+        if job.spec.workspace_ref == "ws_artifact_tamper" {
+            bytes.extend_from_slice(b"tampered");
+        }
+        if bytes.len() > max_bytes {
+            return Err(RuntimeError::Validation(
+                "artifact exceeds the bounded byte-read limit".into(),
+            ));
+        }
+        Ok(Bytes::from(bytes))
     }
 
     async fn cancel_job(&self, _executor_id: &str) -> Result<()> {
@@ -659,6 +688,49 @@ impl DockerExecutor {
         )))
     }
 
+    async fn wait_for_artifact_reader(&self, executor_id: &str) -> Result<()> {
+        for _ in 0..1200 {
+            let inspection = self
+                .docker
+                .inspect_container(executor_id, None::<InspectContainerOptions>)
+                .await
+                .map_err(executor_error)?;
+            let state = inspection.state.unwrap_or_default();
+            if !state.running.unwrap_or(false) {
+                let exit_code = state.exit_code.unwrap_or(-1);
+                if exit_code == 0 {
+                    return Ok(());
+                }
+                let mut logs = self.docker.logs(
+                    executor_id,
+                    Some(LogsOptions::<String> {
+                        stdout: false,
+                        stderr: true,
+                        tail: "all".into(),
+                        ..Default::default()
+                    }),
+                );
+                let mut stderr = String::new();
+                while let Some(output) = logs.next().await {
+                    if let LogOutput::StdErr { message } = output.map_err(executor_error)? {
+                        let remaining = (8 * 1024_usize).saturating_sub(stderr.len());
+                        stderr.push_str(&String::from_utf8_lossy(
+                            &message[..message.len().min(remaining)],
+                        ));
+                    }
+                }
+                return Err(RuntimeError::Validation(format!(
+                    "artifact reader rejected the requested bytes: {}",
+                    stderr.trim()
+                )));
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        Err(RuntimeError::Executor(
+            "artifact reader exceeded its 30 second deadline".into(),
+        ))
+    }
+
     fn locked_host_config(
         &self,
         network: &str,
@@ -906,6 +978,94 @@ impl DockerExecutor {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
+
+    async fn read_artifact_from_volume(
+        &self,
+        job: &ResolvedJob,
+        artifact: &ArtifactManifestEntry,
+        max_bytes: usize,
+    ) -> Result<Bytes> {
+        if artifact.size_bytes < 0
+            || artifact.size_bytes as usize > max_bytes
+            || max_bytes > crate::model::MAX_ARTIFACT_DOWNLOAD_BYTES
+        {
+            return Err(RuntimeError::Validation(
+                "artifact exceeds the bounded byte-read limit".into(),
+            ));
+        }
+        let name = format!("shennong-artifact-read-{}", Uuid::new_v4());
+        let mut labels = self.managed_labels("artifact-reader");
+        labels.insert("dev.shennong.job_id".into(), job.id.to_string());
+        let request = serde_json::json!({
+            "path": artifact.relative_path,
+            "size_bytes": artifact.size_bytes,
+            "sha256": artifact.sha256.to_ascii_lowercase(),
+            "max_bytes": max_bytes,
+        });
+        let config = ContainerConfig {
+            image: Some(job.profile.image.clone()),
+            entrypoint: Some(vec![
+                "python3".into(),
+                "/opt/shennong/bin/read_artifact.py".into(),
+            ]),
+            cmd: Some(Vec::new()),
+            env: Some(vec![
+                format!("SHENNONG_ARTIFACT_READ_JSON={request}"),
+                "PYTHONDONTWRITEBYTECODE=1".into(),
+            ]),
+            user: Some(CONTAINER_USER.into()),
+            working_dir: Some("/workspace".into()),
+            attach_stdout: Some(false),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            open_stdin: Some(false),
+            labels: Some(labels),
+            host_config: Some(self.locked_host_config(
+                "none",
+                &job.workspace_volume,
+                &job.spec.resources,
+                false,
+                true,
+            )),
+            ..Default::default()
+        };
+        let helper_id = self.create_and_start(&name, config).await?;
+        let result = timeout(Duration::from_secs(30), async {
+            self.wait_for_artifact_reader(&helper_id).await?;
+            let mut stream = self.docker.download_from_container(
+                &helper_id,
+                Some(DownloadFromContainerOptions {
+                    path: "/tmp/shennong-artifact",
+                }),
+            );
+            let archive_limit = max_bytes.saturating_add(1024 * 1024);
+            let mut archive = Vec::with_capacity(
+                (artifact.size_bytes as usize)
+                    .saturating_add(2048)
+                    .min(archive_limit),
+            );
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(executor_error)?;
+                if archive.len().saturating_add(chunk.len()) > archive_limit {
+                    return Err(RuntimeError::Validation(
+                        "artifact reader archive exceeded its bounded limit".into(),
+                    ));
+                }
+                archive.extend_from_slice(&chunk);
+            }
+            extract_single_artifact(&archive, max_bytes)
+        })
+        .await
+        .map_err(|_| {
+            RuntimeError::Executor("artifact reader exceeded its 30 second deadline".into())
+        })
+        .and_then(|result| result);
+        let cleanup = self.cleanup_job(&helper_id).await;
+        match (result, cleanup) {
+            (Ok(bytes), Ok(())) => Ok(bytes),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
 }
 
 #[async_trait]
@@ -1052,6 +1212,16 @@ impl Executor for DockerExecutor {
         self.scan_artifacts(job).await
     }
 
+    async fn read_artifact(
+        &self,
+        job: &ResolvedJob,
+        artifact: &ArtifactManifestEntry,
+        max_bytes: usize,
+    ) -> Result<Bytes> {
+        self.read_artifact_from_volume(job, artifact, max_bytes)
+            .await
+    }
+
     async fn cancel_job(&self, executor_id: &str) -> Result<()> {
         match self
             .docker
@@ -1117,7 +1287,14 @@ impl Executor for DockerExecutor {
             let helper_within_grace = helper_orphan_within_grace(kind, container.created, now);
             if matches!(
                 kind,
-                Some("job" | "session" | "artifact-scanner" | "workspace-init")
+                Some(
+                    "job"
+                        | "session"
+                        | "artifact-scanner"
+                        | "artifact-reader"
+                        | "workspace-init"
+                        | "workspace-stage"
+                )
             ) && !known_executor_ids.contains(&id)
                 && !helper_within_grace
                 && let Err(error) = self.cleanup_job(&id).await
@@ -1455,7 +1632,7 @@ fn push_log_chunk(logs: &mut Vec<(LogStream, String)>, stream: LogStream, messag
 fn helper_orphan_within_grace(kind: Option<&str>, created: Option<i64>, now: i64) -> bool {
     matches!(
         kind,
-        Some("artifact-scanner" | "workspace-init" | "workspace-stage")
+        Some("artifact-scanner" | "artifact-reader" | "workspace-init" | "workspace-stage")
     ) && created.is_some_and(|created| now.saturating_sub(created) < 120)
 }
 
@@ -1539,9 +1716,10 @@ fn build_workspace_tar(
             })?;
     }
     for file in files {
+        let bytes = file.decoded_bytes()?;
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(file.content.len() as u64);
+        header.set_size(bytes.len() as u64);
         header.set_mode(0o600);
         header.set_uid(65_532);
         header.set_gid(65_532);
@@ -1551,7 +1729,7 @@ fn build_workspace_tar(
             .append_data(
                 &mut header,
                 format!("{root}/{}", file.path),
-                file.content.as_bytes(),
+                bytes.as_slice(),
             )
             .map_err(|error| {
                 RuntimeError::Internal(format!("cannot build workspace input archive: {error}"))
@@ -1562,6 +1740,121 @@ fn build_workspace_tar(
     })
 }
 
+fn extract_single_artifact(archive: &[u8], max_bytes: usize) -> Result<Bytes> {
+    use std::io::Read;
+
+    let mut extracted = None;
+    let mut archive = tar::Archive::new(archive);
+    let entries = archive
+        .entries()
+        .map_err(|error| RuntimeError::Executor(format!("invalid artifact archive: {error}")))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| RuntimeError::Executor(format!("invalid artifact entry: {error}")))?;
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            continue;
+        }
+        if !kind.is_file() || extracted.is_some() {
+            return Err(RuntimeError::Executor(
+                "artifact reader returned a non-regular or multi-file archive".into(),
+            ));
+        }
+        let size =
+            entry.header().size().map_err(|error| {
+                RuntimeError::Executor(format!("invalid artifact size: {error}"))
+            })? as usize;
+        if size > max_bytes {
+            return Err(RuntimeError::Validation(
+                "artifact reader returned more bytes than allowed".into(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(size);
+        entry
+            .take((max_bytes + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| RuntimeError::Executor(format!("cannot read artifact: {error}")))?;
+        if bytes.len() != size || bytes.len() > max_bytes {
+            return Err(RuntimeError::Executor(
+                "artifact reader returned a truncated or oversized file".into(),
+            ));
+        }
+        extracted = Some(Bytes::from(bytes));
+    }
+    extracted.ok_or_else(|| RuntimeError::Executor("artifact reader returned no file".into()))
+}
+
+fn mock_artifact_bytes(job: &ResolvedJob, path: &str) -> Option<Vec<u8>> {
+    match path {
+        "results/mock-result.txt" => Some(b"mock artifact\n".to_vec()),
+        "results/mock-result-bundle.json" => Some(mock_result_bundle(job)),
+        _ => None,
+    }
+}
+
+fn mock_result_bundle(job: &ResolvedJob) -> Vec<u8> {
+    let output = b"mock artifact\n";
+    let output_sha256 = if job
+        .spec
+        .argv
+        .iter()
+        .any(|value| value == "mock-bundle-output-mismatch")
+    {
+        "0".repeat(64)
+    } else {
+        hex::encode(Sha256::digest(output))
+    };
+    let mut bundle = serde_json::json!({
+        "schema": crate::model::RESULT_BUNDLE_SCHEMA,
+        "created_at": "2026-07-26T00:00:00Z",
+        "result": {
+            "schema_version": "1.0.0",
+            "analysis_type": "bulk_de",
+            "name": "mock_result",
+            "method": "mock",
+            "backend": "mock",
+            "input": {},
+            "parameters": {},
+            "tables": {},
+            "embeddings": {},
+            "graphs": {},
+            "models": {},
+            "diagnostics": {},
+            "warnings": [],
+            "provenance": {}
+        },
+        "validation": {"valid": true, "errors": [], "warnings": []},
+        "inputs": [{
+            "role": "expression",
+            "resource_id": "mock-resource",
+            "revision": "revision-1",
+            "digest": {"algorithm": "sha256", "value": "a".repeat(64)}
+        }],
+        "provenance": {
+            "package_versions": {"Shennong": "0.2.0.9000"},
+            "random_seed": 1,
+            "result_timestamp": "2026-07-26 UTC",
+            "execution": {"runtime": "mock"}
+        },
+        "artifacts": [{
+            "role": "primary_table",
+            "path": "results/mock-result.txt",
+            "media_type": "text/plain",
+            "size_bytes": output.len(),
+            "digest": {"algorithm": "sha256", "value": output_sha256}
+        }]
+    });
+    if job
+        .spec
+        .argv
+        .iter()
+        .any(|value| value == "mock-sensitive-bundle")
+    {
+        bundle["provenance"]["execution"]["api_key"] = serde_json::json!("forbidden");
+    }
+    serde_json::to_vec(&bundle).expect("serialize mock Result Bundle")
+}
+
 pub fn workspace_volume_name(workspace_ref: &str) -> String {
     let digest = hex::encode(Sha256::digest(workspace_ref.as_bytes()));
     format!("shennong-ws-{}", &digest[..32])
@@ -1569,15 +1862,20 @@ pub fn workspace_volume_name(workspace_ref: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, fs, io::Read, os::unix::fs::PermissionsExt};
+    use std::{
+        collections::HashMap,
+        fs,
+        io::{self, Read},
+        os::unix::fs::PermissionsExt,
+    };
 
     use super::{
         EgressPolicyAttestation, RSTUDIO_REQUEST_HEADER, SESSION_SECRET_HEADER,
-        authenticated_gateway_probe, build_workspace_tar, helper_orphan_within_grace,
-        is_removal_in_progress, session_secret_digest, validate_egress_policy_attestation,
-        validate_managed_network,
+        authenticated_gateway_probe, build_workspace_tar, extract_single_artifact,
+        helper_orphan_within_grace, is_removal_in_progress, session_secret_digest,
+        validate_egress_policy_attestation, validate_managed_network,
     };
-    use crate::model::WorkspaceFile;
+    use crate::model::{WorkspaceFile, WorkspaceFileEncoding};
     use sha2::{Digest, Sha256};
     use uuid::Uuid;
 
@@ -1615,6 +1913,7 @@ mod tests {
             job_id,
             &[WorkspaceFile {
                 path: "scripts/analysis.py".into(),
+                encoding: crate::model::WorkspaceFileEncoding::Utf8,
                 content: "print('validated')\n".into(),
                 sha256: hex::encode(Sha256::digest(b"print('validated')\n")),
             }],
@@ -1640,6 +1939,49 @@ mod tests {
     }
 
     #[test]
+    fn workspace_input_archive_stages_decoded_binary_bytes() {
+        let payload = [0_u8, 255, 1, 128];
+        let archive = build_workspace_tar(
+            "runtime-secret-instance",
+            Uuid::new_v4(),
+            &[WorkspaceFile {
+                path: "inputs/binary.bin".into(),
+                encoding: WorkspaceFileEncoding::Base64,
+                content: "AP8BgA==".into(),
+                sha256: hex::encode(Sha256::digest(payload)),
+            }],
+        )
+        .expect("workspace archive");
+        let mut content = Vec::new();
+        for entry in tar::Archive::new(archive.as_slice())
+            .entries()
+            .expect("tar entries")
+        {
+            let mut entry = entry.expect("tar entry");
+            if entry.header().entry_type().is_file() {
+                entry.read_to_end(&mut content).expect("binary content");
+            }
+        }
+        assert_eq!(content, payload);
+    }
+
+    #[test]
+    fn artifact_archive_extraction_rejects_symlink_entries() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        header.set_link_name("/etc/passwd").unwrap();
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "shennong-artifact", io::empty())
+            .unwrap();
+        let archive = builder.into_inner().unwrap();
+        assert!(extract_single_artifact(&archive, 1024).is_err());
+    }
+
+    #[test]
     fn active_helper_containers_receive_a_bounded_orphan_grace_period() {
         assert!(helper_orphan_within_grace(
             Some("workspace-init"),
@@ -1649,6 +1991,11 @@ mod tests {
         assert!(helper_orphan_within_grace(
             Some("artifact-scanner"),
             Some(881),
+            1_000
+        ));
+        assert!(helper_orphan_within_grace(
+            Some("artifact-reader"),
+            Some(999),
             1_000
         ));
         assert!(!helper_orphan_within_grace(
