@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "CRAN Debian archive signing-key fingerprint is public verification metadata"
+regexTarget = "line"
+regexes = ['''ARG CRAN_DEBIAN_(?:KEY_FINGERPRINT|SIGNING_FPR)=[0-9A-F]{40}''']
