@@ -6,6 +6,7 @@ FROM ${RUST_IMAGE} AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY container/worker/read_artifact.py ./container/worker/read_artifact.py
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \

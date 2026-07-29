@@ -119,6 +119,7 @@ fn unified_image_pins_and_smoke_tests_the_shennong_r_toolchain() {
 fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
     let reader = read("container/worker/read_artifact.py");
     let executor = read("src/executor.rs");
+    let dockerfile = read("container/runtime.Dockerfile");
     for required in [
         "os.O_NOFOLLOW",
         "dir_fd=directory",
@@ -141,6 +142,11 @@ fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
             "working_dir: Some(\"/workspace\".into()),\n            attach_stdout: Some(true),\n            attach_stderr: Some(true),"
         ),
         "artifact reader must inject the current helper and capture bounded binary stdout"
+    );
+    assert!(
+        dockerfile
+            .contains("COPY container/worker/read_artifact.py ./container/worker/read_artifact.py"),
+        "the Rust builder must receive the embedded artifact reader source"
     );
 }
 
