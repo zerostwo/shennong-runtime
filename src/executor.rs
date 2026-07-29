@@ -1013,7 +1013,7 @@ impl DockerExecutor {
             ]),
             user: Some(CONTAINER_USER.into()),
             working_dir: Some("/workspace".into()),
-            attach_stdout: Some(false),
+            attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
             open_stdin: Some(false),
