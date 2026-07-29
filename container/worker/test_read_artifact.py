@@ -1,4 +1,5 @@
 import errno
+import hashlib
 import importlib.util
 import os
 import pathlib
@@ -72,6 +73,42 @@ class ArtifactReaderTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "byte bounds"):
                 reader.request()
+
+    def test_streams_exact_bytes_and_rejects_digest_mismatch(self) -> None:
+        payload = b"\x00binary artifact\n"
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = pathlib.Path(directory) / "source"
+            output_path = pathlib.Path(directory) / "output"
+            source_path.write_bytes(payload)
+            source = os.open(source_path, os.O_RDONLY)
+            output = os.open(output_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                reader.stream_artifact(
+                    source,
+                    len(payload),
+                    hashlib.sha256(payload).hexdigest(),
+                    len(payload),
+                    output,
+                )
+            finally:
+                os.close(output)
+                os.close(source)
+            self.assertEqual(output_path.read_bytes(), payload)
+
+            source = os.open(source_path, os.O_RDONLY)
+            output = os.open(output_path, os.O_WRONLY | os.O_TRUNC)
+            try:
+                with self.assertRaisesRegex(ValueError, "no longer match"):
+                    reader.stream_artifact(
+                        source,
+                        len(payload),
+                        "0" * 64,
+                        len(payload),
+                        output,
+                    )
+            finally:
+                os.close(output)
+                os.close(source)
 
 
 if __name__ == "__main__":

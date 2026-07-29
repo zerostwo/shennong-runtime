@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy one previously scanned artifact into bounded helper tmpfs.
+"""Stream one previously scanned artifact through bounded helper stdout.
 
 The helper runs networkless with /workspace mounted read-only. Every path
 component is opened relative to an already-open directory with O_NOFOLLOW, so a
@@ -14,9 +14,6 @@ import stat
 
 
 CHUNK_BYTES = 1024 * 1024
-OUTPUT = "/tmp/shennong-artifact"
-
-
 def request() -> tuple[list[str], int, str, int]:
     value = json.loads(os.environ["SHENNONG_ARTIFACT_READ_JSON"])
     if not isinstance(value, dict) or set(value) != {
@@ -69,44 +66,39 @@ def open_artifact(parts: list[str], workspace: str = "/workspace") -> int:
         os.close(directory)
 
 
+def stream_artifact(
+    source: int,
+    expected_size: int,
+    expected_sha256: str,
+    max_bytes: int,
+    output: int = 1,
+) -> None:
+    digest = hashlib.sha256()
+    copied = 0
+    while chunk := os.read(source, CHUNK_BYTES):
+        copied += len(chunk)
+        if copied > max_bytes:
+            raise ValueError("artifact exceeded the bounded read limit")
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            written = os.write(output, view)
+            view = view[written:]
+    if copied != expected_size or digest.hexdigest() != expected_sha256:
+        raise ValueError("artifact bytes no longer match the validated manifest")
+
+
 def main() -> None:
     parts, expected_size, expected_sha256, max_bytes = request()
     source = open_artifact(parts)
-    destination = None
     try:
         metadata = os.fstat(source)
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("artifact read source must be a regular file")
         if metadata.st_size != expected_size or metadata.st_size > max_bytes:
             raise ValueError("artifact size changed after manifest validation")
-        destination = os.open(
-            OUTPUT,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-        )
-        digest = hashlib.sha256()
-        copied = 0
-        while chunk := os.read(source, CHUNK_BYTES):
-            copied += len(chunk)
-            if copied > max_bytes:
-                raise ValueError("artifact exceeded the bounded read limit")
-            digest.update(chunk)
-            view = memoryview(chunk)
-            while view:
-                written = os.write(destination, view)
-                view = view[written:]
-        if copied != expected_size or digest.hexdigest() != expected_sha256:
-            raise ValueError("artifact bytes no longer match the validated manifest")
-        os.fsync(destination)
-    except Exception:
-        try:
-            os.unlink(OUTPUT)
-        except FileNotFoundError:
-            pass
-        raise
+        stream_artifact(source, expected_size, expected_sha256, max_bytes)
     finally:
-        if destination is not None:
-            os.close(destination)
         os.close(source)
 
 

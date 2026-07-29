@@ -4,6 +4,8 @@
 
 - Recover simple-mode job and session Docker networks during health checks when
   they were removed after Runtime startup.
+- Stream bounded Artifact bytes through the helper container's captured stdout
+  so downloads remain available after its tmpfs is unmounted on exit.
 
 All notable changes to this project will be documented in this file.
 

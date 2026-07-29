@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use bollard::{
     Docker,
     container::{
-        Config as ContainerConfig, CreateContainerOptions, DownloadFromContainerOptions,
-        InspectContainerOptions, KillContainerOptions, ListContainersOptions, LogOutput,
-        LogsOptions, RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
+        Config as ContainerConfig, CreateContainerOptions, InspectContainerOptions,
+        KillContainerOptions, ListContainersOptions, LogOutput, LogsOptions,
+        RemoveContainerOptions, StartContainerOptions, StopContainerOptions,
         UploadToContainerOptions,
     },
     errors::Error as BollardError,
@@ -575,7 +575,7 @@ impl DockerExecutor {
             cmd: Some(vec![CONTAINER_USER.into(), "/workspace".into()]),
             user: Some("0:0".into()),
             working_dir: Some("/".into()),
-            attach_stdout: Some(false),
+            attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
             open_stdin: Some(false),
@@ -1032,28 +1032,36 @@ impl DockerExecutor {
         let helper_id = self.create_and_start(&name, config).await?;
         let result = timeout(Duration::from_secs(30), async {
             self.wait_for_artifact_reader(&helper_id).await?;
-            let mut stream = self.docker.download_from_container(
+            let mut logs = self.docker.logs(
                 &helper_id,
-                Some(DownloadFromContainerOptions {
-                    path: "/tmp/shennong-artifact",
+                Some(LogsOptions::<String> {
+                    stdout: true,
+                    stderr: false,
+                    tail: "all".into(),
+                    ..Default::default()
                 }),
             );
-            let archive_limit = max_bytes.saturating_add(1024 * 1024);
-            let mut archive = Vec::with_capacity(
-                (artifact.size_bytes as usize)
-                    .saturating_add(2048)
-                    .min(archive_limit),
-            );
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(executor_error)?;
-                if archive.len().saturating_add(chunk.len()) > archive_limit {
+            let mut bytes = Vec::with_capacity(artifact.size_bytes as usize);
+            while let Some(output) = logs.next().await {
+                let message = match output.map_err(executor_error)? {
+                    LogOutput::StdOut { message } | LogOutput::Console { message } => message,
+                    _ => continue,
+                };
+                if bytes.len().saturating_add(message.len()) > max_bytes {
                     return Err(RuntimeError::Validation(
-                        "artifact reader archive exceeded its bounded limit".into(),
+                        "artifact reader output exceeded its bounded limit".into(),
                     ));
                 }
-                archive.extend_from_slice(&chunk);
+                bytes.extend_from_slice(&message);
             }
-            extract_single_artifact(&archive, max_bytes)
+            if bytes.len() != artifact.size_bytes as usize
+                || hex::encode(Sha256::digest(&bytes)) != artifact.sha256.to_ascii_lowercase()
+            {
+                return Err(RuntimeError::Validation(
+                    "artifact reader output no longer matches the validated manifest".into(),
+                ));
+            }
+            Ok(Bytes::from(bytes))
         })
         .await
         .map_err(|_| {
@@ -1749,50 +1757,6 @@ fn build_workspace_tar(
     })
 }
 
-fn extract_single_artifact(archive: &[u8], max_bytes: usize) -> Result<Bytes> {
-    use std::io::Read;
-
-    let mut extracted = None;
-    let mut archive = tar::Archive::new(archive);
-    let entries = archive
-        .entries()
-        .map_err(|error| RuntimeError::Executor(format!("invalid artifact archive: {error}")))?;
-    for entry in entries {
-        let entry = entry
-            .map_err(|error| RuntimeError::Executor(format!("invalid artifact entry: {error}")))?;
-        let kind = entry.header().entry_type();
-        if kind.is_dir() {
-            continue;
-        }
-        if !kind.is_file() || extracted.is_some() {
-            return Err(RuntimeError::Executor(
-                "artifact reader returned a non-regular or multi-file archive".into(),
-            ));
-        }
-        let size =
-            entry.header().size().map_err(|error| {
-                RuntimeError::Executor(format!("invalid artifact size: {error}"))
-            })? as usize;
-        if size > max_bytes {
-            return Err(RuntimeError::Validation(
-                "artifact reader returned more bytes than allowed".into(),
-            ));
-        }
-        let mut bytes = Vec::with_capacity(size);
-        entry
-            .take((max_bytes + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|error| RuntimeError::Executor(format!("cannot read artifact: {error}")))?;
-        if bytes.len() != size || bytes.len() > max_bytes {
-            return Err(RuntimeError::Executor(
-                "artifact reader returned a truncated or oversized file".into(),
-            ));
-        }
-        extracted = Some(Bytes::from(bytes));
-    }
-    extracted.ok_or_else(|| RuntimeError::Executor("artifact reader returned no file".into()))
-}
-
 fn mock_artifact_bytes(job: &ResolvedJob, path: &str) -> Option<Vec<u8>> {
     match path {
         "results/mock-result.txt" => Some(b"mock artifact\n".to_vec()),
@@ -1871,18 +1835,13 @@ pub fn workspace_volume_name(workspace_ref: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        fs,
-        io::{self, Read},
-        os::unix::fs::PermissionsExt,
-    };
+    use std::{collections::HashMap, fs, io::Read, os::unix::fs::PermissionsExt};
 
     use super::{
         EgressPolicyAttestation, RSTUDIO_REQUEST_HEADER, SESSION_SECRET_HEADER,
-        authenticated_gateway_probe, build_workspace_tar, extract_single_artifact,
-        helper_orphan_within_grace, is_removal_in_progress, session_secret_digest,
-        validate_egress_policy_attestation, validate_managed_network,
+        authenticated_gateway_probe, build_workspace_tar, helper_orphan_within_grace,
+        is_removal_in_progress, session_secret_digest, validate_egress_policy_attestation,
+        validate_managed_network,
     };
     use crate::model::{WorkspaceFile, WorkspaceFileEncoding};
     use sha2::{Digest, Sha256};
@@ -1972,22 +1931,6 @@ mod tests {
             }
         }
         assert_eq!(content, payload);
-    }
-
-    #[test]
-    fn artifact_archive_extraction_rejects_symlink_entries() {
-        let mut builder = tar::Builder::new(Vec::new());
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_size(0);
-        header.set_mode(0o777);
-        header.set_link_name("/etc/passwd").unwrap();
-        header.set_cksum();
-        builder
-            .append_data(&mut header, "shennong-artifact", io::empty())
-            .unwrap();
-        let archive = builder.into_inner().unwrap();
-        assert!(extract_single_artifact(&archive, 1024).is_err());
     }
 
     #[test]
