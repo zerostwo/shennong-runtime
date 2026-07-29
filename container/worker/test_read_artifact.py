@@ -1,3 +1,4 @@
+import base64
 import errno
 import hashlib
 import importlib.util
@@ -93,7 +94,7 @@ class ArtifactReaderTests(unittest.TestCase):
             finally:
                 os.close(output)
                 os.close(source)
-            self.assertEqual(output_path.read_bytes(), payload)
+            self.assertEqual(base64.b64decode(output_path.read_bytes()), payload)
 
             source = os.open(source_path, os.O_RDONLY)
             output = os.open(output_path, os.O_WRONLY | os.O_TRUNC)
