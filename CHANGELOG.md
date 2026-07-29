@@ -6,6 +6,8 @@
   they were removed after Runtime startup.
 - Stream bounded Artifact bytes through the helper container's captured stdout
   so downloads remain available after its tmpfs is unmounted on exit.
+- Inject the current Artifact reader into historical worker images so completed
+  Jobs remain downloadable after the Runtime helper contract changes.
 
 All notable changes to this project will be documented in this file.
 

@@ -134,11 +134,13 @@ fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
     }
     assert!(
         executor.contains(
-            "entrypoint: Some(vec![\n                \"python3\".into(),\n                \"/opt/shennong/bin/read_artifact.py\".into(),\n            ]),"
+            "const ARTIFACT_READER_SOURCE: &str = include_str!(\"../container/worker/read_artifact.py\");"
+        ) && executor.contains(
+            "entrypoint: Some(vec![\"python3\".into()]),\n            cmd: Some(vec![\"-c\".into(), ARTIFACT_READER_SOURCE.into()]),"
         ) && executor.contains(
             "working_dir: Some(\"/workspace\".into()),\n            attach_stdout: Some(true),\n            attach_stderr: Some(true),"
         ),
-        "artifact reader must capture bounded binary stdout"
+        "artifact reader must inject the current helper and capture bounded binary stdout"
     );
 }
 

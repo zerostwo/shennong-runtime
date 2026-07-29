@@ -43,6 +43,7 @@ const CONTAINER_USER: &str = "65532:65532";
 const IDE_GATEWAY_PORT: u16 = 18_080;
 const SESSION_SECRET_HEADER: &str = "x-shennong-session-secret";
 const RSTUDIO_REQUEST_HEADER: &str = "x-shennong-rstudio-request";
+const ARTIFACT_READER_SOURCE: &str = include_str!("../container/worker/read_artifact.py");
 
 #[derive(Clone)]
 struct EgressPolicyGuard {
@@ -1004,11 +1005,8 @@ impl DockerExecutor {
         });
         let config = ContainerConfig {
             image: Some(job.profile.image.clone()),
-            entrypoint: Some(vec![
-                "python3".into(),
-                "/opt/shennong/bin/read_artifact.py".into(),
-            ]),
-            cmd: Some(Vec::new()),
+            entrypoint: Some(vec!["python3".into()]),
+            cmd: Some(vec!["-c".into(), ARTIFACT_READER_SOURCE.into()]),
             env: Some(vec![
                 format!("SHENNONG_ARTIFACT_READ_JSON={request}"),
                 "PYTHONDONTWRITEBYTECODE=1".into(),
