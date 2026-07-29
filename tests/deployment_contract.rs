@@ -118,6 +118,7 @@ fn unified_image_pins_and_smoke_tests_the_shennong_r_toolchain() {
 #[test]
 fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
     let reader = read("container/worker/read_artifact.py");
+    let executor = read("src/executor.rs");
     for required in [
         "os.O_NOFOLLOW",
         "dir_fd=directory",
@@ -131,6 +132,14 @@ fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
             "missing artifact-reader guard: {required}"
         );
     }
+    assert!(
+        executor.contains(
+            "entrypoint: Some(vec![\n                \"python3\".into(),\n                \"/opt/shennong/bin/read_artifact.py\".into(),\n            ]),"
+        ) && executor.contains(
+            "working_dir: Some(\"/workspace\".into()),\n            attach_stdout: Some(true),\n            attach_stderr: Some(true),"
+        ),
+        "artifact reader must capture bounded binary stdout"
+    );
 }
 
 #[test]
