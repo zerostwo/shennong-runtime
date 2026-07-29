@@ -1076,6 +1076,15 @@ impl Executor for DockerExecutor {
 
     async fn ping(&self) -> Result<()> {
         self.docker.ping().await.map_err(executor_error)?;
+        if !self.hardened {
+            // Simple-mode networks may be removed by an operator or `docker
+            // network prune` while the long-running Runtime container is
+            // otherwise healthy. Reconcile them here so health checks restore
+            // the executor instead of leaving it unavailable until restart.
+            self.ensure_simple_network(&self.job_network, false).await?;
+            self.ensure_simple_network(&self.session_network, false)
+                .await?;
+        }
         self.verify_launch_policy().await?;
         Ok(())
     }
