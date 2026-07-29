@@ -7,6 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use bollard::{
     Docker,
     container::{
@@ -1039,19 +1040,23 @@ impl DockerExecutor {
                     ..Default::default()
                 }),
             );
-            let mut bytes = Vec::with_capacity(artifact.size_bytes as usize);
+            let encoded_size = (artifact.size_bytes as usize).div_ceil(3).saturating_mul(4);
+            let mut encoded = Vec::with_capacity(encoded_size);
             while let Some(output) = logs.next().await {
                 let message = match output.map_err(executor_error)? {
                     LogOutput::StdOut { message } | LogOutput::Console { message } => message,
                     _ => continue,
                 };
-                if bytes.len().saturating_add(message.len()) > max_bytes {
+                if encoded.len().saturating_add(message.len()) > encoded_size {
                     return Err(RuntimeError::Validation(
-                        "artifact reader output exceeded its bounded limit".into(),
+                        "artifact reader encoded output exceeded its bounded limit".into(),
                     ));
                 }
-                bytes.extend_from_slice(&message);
+                encoded.extend_from_slice(&message);
             }
+            let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| {
+                RuntimeError::Validation("artifact reader output was not valid base64".into())
+            })?;
             if bytes.len() != artifact.size_bytes as usize
                 || hex::encode(Sha256::digest(&bytes)) != artifact.sha256.to_ascii_lowercase()
             {

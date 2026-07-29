@@ -127,6 +127,7 @@ fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
         "expected_size > max_bytes",
         "copied > max_bytes",
         "digest.hexdigest() != expected_sha256",
+        "base64.b64encode(chunk)",
     ] {
         assert!(
             reader.contains(required),
@@ -150,7 +151,11 @@ fn artifact_reader_uses_networkless_no_follow_openat_and_bounded_copy() {
         ) && artifact_reader_config.contains(
             "working_dir: Some(\"/workspace\".into()),\n            attach_stdout: Some(true),\n            attach_stderr: Some(true),"
         ),
-        "artifact reader must inject the current helper and capture bounded binary stdout"
+        "artifact reader must inject the current helper and capture bounded stdout"
+    );
+    assert!(
+        executor.contains("BASE64_STANDARD.decode(encoded)"),
+        "artifact reader stdout must be decoded from base64 before manifest validation"
     );
     assert!(
         dockerfile

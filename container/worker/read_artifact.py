@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Stream one previously scanned artifact through bounded helper stdout.
+"""Stream one previously scanned artifact as bounded Base64 helper stdout.
 
 The helper runs networkless with /workspace mounted read-only. Every path
 component is opened relative to an already-open directory with O_NOFOLLOW, so a
 workspace symlink or rename race cannot redirect the read into the image root.
+Base64 keeps arbitrary binary artifacts intact across Docker's UTF-8 log path.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -13,7 +15,9 @@ import pathlib
 import stat
 
 
-CHUNK_BYTES = 1024 * 1024
+CHUNK_BYTES = 3 * 1024 * 1024
+
+
 def request() -> tuple[list[str], int, str, int]:
     value = json.loads(os.environ["SHENNONG_ARTIFACT_READ_JSON"])
     if not isinstance(value, dict) or set(value) != {
@@ -80,7 +84,7 @@ def stream_artifact(
         if copied > max_bytes:
             raise ValueError("artifact exceeded the bounded read limit")
         digest.update(chunk)
-        view = memoryview(chunk)
+        view = memoryview(base64.b64encode(chunk))
         while view:
             written = os.write(output, view)
             view = view[written:]
